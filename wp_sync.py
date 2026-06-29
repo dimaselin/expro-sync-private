@@ -432,13 +432,16 @@ def find_existing_post(ssh: SSHClient, expro_id: str) -> Optional[int]:
 
 def get_all_posts_expro(ssh: SSHClient) -> list:
     """Return list of (post_id, expro_id) for all inwestycja posts. Single SSH call."""
-    out = ssh.run_wp_cli(
-        r"eval \"\$posts = get_posts(['post_type'=>'inwestycja','posts_per_page'=>-1,'fields'=>'ids']);"
-        r" foreach(\$posts as \$id){"
-        r"   \$eid = get_post_meta(\$id,'expro_id',true);"
-        r"   if(\$eid) echo \$id.','.\$eid.\"\n\";"
-        r" }\""
+    php = (
+        "<?php\n"
+        "$posts=get_posts(['post_type'=>'inwestycja','posts_per_page'=>-1,'fields'=>'ids','post_status'=>'publish']);\n"
+        "foreach($posts as $id){\n"
+        "    $eid=get_post_meta($id,'expro_id',true);\n"
+        "    if($eid) echo $id.','.$eid.\"\\n\";\n"
+        "}\n"
     )
+    ssh.write_remote_file(php, '/tmp/esm_posts.php')
+    out = ssh.run_wp_cli('eval-file /tmp/esm_posts.php')
     result = []
     for line in out.strip().splitlines():
         parts = line.strip().split(',', 1)
