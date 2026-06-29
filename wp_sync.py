@@ -433,11 +433,11 @@ def find_existing_post(ssh: SSHClient, expro_id: str) -> Optional[int]:
 def get_all_posts_expro(ssh: SSHClient) -> list:
     """Return list of (post_id, expro_id) for all inwestycja posts. Single SSH call."""
     out = ssh.run_wp_cli(
-        "eval \"$posts = get_posts(['post_type'=>'inwestycja','posts_per_page'=>-1,'fields'=>'ids']);"
-        " foreach($posts as $id){"
-        "   $eid = get_post_meta($id,'expro_id',true);"
-        "   if($eid) echo $id.','.$eid.\\\"\\n\\\";"
-        " }\""
+        r"eval \"\$posts = get_posts(['post_type'=>'inwestycja','posts_per_page'=>-1,'fields'=>'ids']);"
+        r" foreach(\$posts as \$id){"
+        r"   \$eid = get_post_meta(\$id,'expro_id',true);"
+        r"   if(\$eid) echo \$id.','.\$eid.\"\n\";"
+        r" }\""
     )
     result = []
     for line in out.strip().splitlines():
