@@ -107,5 +107,9 @@ jobs:
           print('config.py created')
           PYEOF
 
+      - name: Scrape ExPro data (if needed)
+        if: ${{ github.event.inputs.mode != 'all' && github.event.inputs.mode != 'scrape' && github.event.inputs.mode != '' }}
+        run: python3 run.py scrape
+
       - name: Run sync
         run: python3 run.py ${{ github.event.inputs.mode || 'all' }}
