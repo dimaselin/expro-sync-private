@@ -18,10 +18,14 @@ on:
           - media
           - pipeline
 
+concurrency:
+  group: expro-sync
+  cancel-in-progress: false   # черга — не скасовувати запущений
+
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360      # 6 год — вистачить навіть на перший повний scrape
 
     steps:
       - name: Checkout
@@ -113,3 +117,38 @@ jobs:
 
       - name: Run sync
         run: python3 run.py ${{ github.event.inputs.mode || 'all' }}
+
+      - name: Write job summary
+        if: always()
+        run: |
+          echo "## ExPro Sync — $(date '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "**Tryb:** \`${{ github.event.inputs.mode || 'all' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f data/expro_data.json ]; then
+            INV=$(python3 -c "import json; d=json.load(open('data/expro_data.json')); print(len(d))" 2>/dev/null || echo "?")
+            UNITS=$(python3 -c "import json; d=json.load(open('data/expro_data.json')); print(sum(len(i.get('units',[])) for i in d))" 2>/dev/null || echo "?")
+            PHOTOS=$(python3 -c "import json; d=json.load(open('data/expro_data.json')); print(sum(len(u.get('photo_urls',[])) for i in d for u in i.get('units',[])))" 2>/dev/null || echo "?")
+            echo "| Metryka | Wartość |" >> $GITHUB_STEP_SUMMARY
+            echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+            echo "| Inwestycji | $INV |" >> $GITHUB_STEP_SUMMARY
+            echo "| Lokali (units) | $UNITS |" >> $GITHUB_STEP_SUMMARY
+            echo "| Zdjęć lokali | $PHOTOS |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f logs/sync.log ]; then
+            echo "### Ostatnie logi" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -60 logs/sync.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload logs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-logs-${{ github.run_number }}
+          path: |
+            logs/
+            data/expro_data.json
+          retention-days: 14
+          if-no-files-found: ignore

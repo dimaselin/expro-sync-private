@@ -205,13 +205,13 @@ foreach ($units as $u) {
 
     // ── Create or update post ────────────────────────────────────────────
     if (!empty($existing)) {
-        $post_id = (int)$existing[0];
-        wp_update_post([
-            'ID'           => $post_id,
-            'post_title'   => $title,
-            'post_content' => $content,
-            'post_status'  => 'publish',
-        ]);
+        $post_id   = (int)$existing[0];
+        $upd_args  = ['ID' => $post_id, 'post_title' => $title, 'post_status' => 'publish'];
+        // Skip overwriting description if manually locked
+        if (!get_post_meta($post_id, '_description_locked', true)) {
+            $upd_args['post_content'] = $content;
+        }
+        wp_update_post($upd_args);
         $updated++;
     } else {
         $post_id = wp_insert_post([
