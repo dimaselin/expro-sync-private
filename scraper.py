@@ -518,10 +518,44 @@ def scrape_detail(page, inv_id: str, known_unit_photos: dict | None = None) -> O
         # Reuse cached data from previous scrape
         if rid and rid in known_unit_photos:
             cached = known_unit_photos[rid]
-            if cached.get("photo_urls"):
-                unit["photo_urls"] = cached["photo_urls"]
-            if cached.get("plan_urls"):
-                unit["plan_urls"] = cached["plan_urls"]
+            photo_urls = cached.get("photo_urls", [])
+            plan_urls  = cached.get("plan_urls",  [])
+            if photo_urls:
+                unit["photo_urls"] = photo_urls
+            if plan_urls:
+                unit["plan_urls"] = plan_urls
+            # Re-download images using fast page.request (no tab) if not on disk
+            img_dir = Path(f"data/images/{rid}")
+            img_dir.mkdir(parents=True, exist_ok=True)
+            pu_map, pl_map = {}, {}
+            for i, url in enumerate(photo_urls):
+                lp = img_dir / f"photo_{i}.jpg"
+                if lp.exists():
+                    pu_map[url] = str(lp)
+                else:
+                    try:
+                        r = page.context.request.get(url)
+                        if r.ok:
+                            lp.write_bytes(r.body())
+                            pu_map[url] = str(lp)
+                    except Exception:
+                        pass
+            for i, url in enumerate(plan_urls):
+                lp = img_dir / f"plan_{i}.jpg"
+                if lp.exists():
+                    pl_map[url] = str(lp)
+                else:
+                    try:
+                        r = page.context.request.get(url)
+                        if r.ok:
+                            lp.write_bytes(r.body())
+                            pl_map[url] = str(lp)
+                    except Exception:
+                        pass
+            if pu_map:
+                unit["photo_url_map"] = pu_map
+            if pl_map:
+                unit["plan_url_map"] = pl_map
             unit.pop("_action_links", None)
             continue
 
