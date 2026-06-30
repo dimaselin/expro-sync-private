@@ -500,6 +500,21 @@ def scrape_detail(page, inv_id: str) -> Optional[dict]:
                 if rid_m:
                     unit["realestate_id"] = rid_m.group(1)
 
+    # ── zasady współpracy (commission terms) ─────────────────────────────────
+    zasady: dict[str, str] = {}
+    zasady_labels = {
+        "stawka_standard":   "Stawka standard",
+        "stawka_vip":        "Stawka VIP",
+        "warunki":           "Warunki wynagrodzenia",
+        "garaz_w_prowizji":  "Garaż/komórka wliczana do prowizji",
+        "termin_wyplaty":    "Termin wypłaty prowizji (dni)",
+        "waznosc_zgloszenia":"Ważność zgłoszenia",
+    }
+    for key, label in zasady_labels.items():
+        val = extract_field(label, text)
+        if val:
+            zasady[key] = val
+
     # ── contact ──────────────────────────────────────────────────────────────
     contact: dict[str, str] = {"name": "", "phone": "", "email": ""}
     phone_m = re.search(r"(\+?48[\s-]?\d{3}[\s-]?\d{3}[\s-]?\d{3}|\d{3}[\s-]?\d{3}[\s-]?\d{3})", text)
@@ -542,6 +557,7 @@ def scrape_detail(page, inv_id: str) -> Optional[dict]:
         "contact": contact,
         "units": units,
         "documents": documents,
+        "zasady_wspolpracy": zasady,
         "last_updated_expro": last_updated_expro,
         "scrape_hash": "",  # filled below
     }

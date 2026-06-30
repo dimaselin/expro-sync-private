@@ -561,6 +561,8 @@ def sync_investment(ssh: SSHClient, inv: dict) -> Tuple[str, Optional[int]]:
             # coordinates (filled later by geocoding phase)
             ("projekt_lat",           str(inv.get("lat", ""))),
             ("projekt_lng",           str(inv.get("lng", ""))),
+            # commission terms from ExPro "Zasady współpracy"
+            ("projekt_komisja",       json.dumps(inv.get("zasady_wspolpracy", {}), ensure_ascii=False) if inv.get("zasady_wspolpracy") else ""),
         ]
 
         for key, value in meta_fields:
