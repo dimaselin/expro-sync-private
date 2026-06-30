@@ -591,6 +591,11 @@ def main():
     if args.all:
         pairs = get_all_posts_expro(ssh)
         log(f'Total posts: {len(pairs)}')
+        test_inv = os.environ.get("EXPRO_TEST_INV_ID", "").strip()
+        if test_inv:
+            test_ids = set(test_inv.split(","))
+            pairs = [(pid, eid) for pid, eid in pairs if eid in test_ids]
+            log(f'TEST MODE: filtered to {len(pairs)} investment(s): {test_inv}')
         if not args.force:
             # Filter to only posts that need enrichment
             needs = []

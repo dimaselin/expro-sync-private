@@ -11,6 +11,7 @@ Usage:
 """
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -199,6 +200,11 @@ def main():
     if args.all:
         pairs = get_all_posts_expro(ssh)
         log(f'Found {len(pairs)} posts in WP')
+        test_inv = os.environ.get("EXPRO_TEST_INV_ID", "").strip()
+        if test_inv:
+            test_ids = set(test_inv.split(","))
+            pairs = [(pid, eid) for pid, eid in pairs if eid in test_ids]
+            log(f'TEST MODE: filtered to {len(pairs)} investment(s): {test_inv}')
     else:
         # Single post: look up expro_id from WP
         raw = ssh.run_wp_cli(f'post meta get {args.post_id} expro_id').strip()
