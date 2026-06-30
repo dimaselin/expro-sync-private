@@ -384,7 +384,8 @@ foreach ($units as $u) {
             $plan_att = media_sideload_image($plan_url, $post_id, null, 'id');
         }
         if (!is_wp_error($plan_att)) {
-            update_post_meta($post_id, 'lokal_plan_attachment_id', (string)$plan_att);
+            update_post_meta($plan_att,  '_source_url',              $plan_url);
+            update_post_meta($post_id,   'lokal_plan_attachment_id', (string)$plan_att);
         } else {
             update_post_meta($post_id, 'lokal_plan_url_expro', $plan_url);
         }
