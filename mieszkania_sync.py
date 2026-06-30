@@ -1,357 +1,362 @@
 #!/usr/bin/env python3
 """
-Sync apartment (Mieszkanie) investments from ExPro to WordPress.
-Creates inwestycja posts with projekt_typ=mieszkanie and apartment-specific meta.
+Mieszkania sync — creates/updates individual `property` WP posts for each ExPro unit.
+Each apartment/house unit from ExPro becomes one property post in Houzez.
 
 Usage:
-  python3 mieszkania_sync.py --expro-ids 7567,7161,5758   # test 3
-  python3 mieszkania_sync.py --all                         # all 106
+  python3 mieszkania_sync.py --all
+  python3 mieszkania_sync.py --expro-ids 7567,7563
 """
 import argparse, json, re, sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).parent))
-from wp_sync import SSHClient, update_meta, import_image_to_wp, log
+from wp_sync import SSHClient, log
 
 DATA = Path(__file__).parent / 'data' / 'expro_data.json'
-WP_URL = 'https://realsymanagement.pl'
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Taxonomy term IDs (verified on site) ─────────────────────────────────────
+LABEL_RYNEK_PIERWOTNY = 181   # property_label: Rynek Pierwotny
 
-def parse_price(raw: str) -> int:
-    """Extract first number from price string like '517 355,78 PLN'."""
-    m = re.search(r'[\d\s]+', raw.replace(',', '.'))
-    if m:
-        try:
-            return int(float(re.sub(r'\s', '', m.group(0).strip())))
-        except:
-            pass
-    return 0
+STATUS_SLUG_MAP = {
+    'dostępne':      'wolny',
+    'dostepne':      'wolny',
+    'wolne':         'wolny',
+    'zarezerwowane': 'zarezerwowany',
+    'rezerwacja':    'zarezerwowany',
+    'sprzedane':     'sprzedany',
+    'sprzedany':     'sprzedany',
+}
 
-def format_price_pln(amount: int) -> str:
-    if not amount:
-        return ''
-    return f'{amount:,} PLN'.replace(',', ' ')
+TYPE_SLUG_MAP = {
+    'mieszkanie':    'mieszkanie',
+    'apartament':    'mieszkanie',
+    'dom szereg':    'dom-szeregowy',
+    'blizniak':      'blizniak',
+    'dom wolno':     'dom-wolnostojacy',
+    'lokal':         'lokal-uzytkowy',
+    'biuro':         'lokal-uzytkowy',
+    'garaz':         'lokal-uzytkowy',
+    'komercja':      'komercja',
+}
 
-def _is_apartment_unit(u: dict) -> bool:
-    t = (u.get('type') or u.get('Typ') or '').lower().strip()
-    return not t or 'mieszkanie' in t or 'apartament' in t or 'lokal' in t
+# ── PHP template executed via eval-file ──────────────────────────────────────
 
-def derive_apartment_meta(inv: dict) -> dict:
-    """Calculate apartment-specific meta from ExPro units."""
-    units = [u for u in inv.get('units', []) if _is_apartment_unit(u)]
-    if not units:
-        units = inv.get('units', [])
+PHP_SYNC_UNITS = r"""<?php
+$raw  = file_get_contents('/tmp/esm_units_data.json');
+$data = json_decode($raw, true);
+if (!$data) { echo json_encode(['error'=>'bad json']); exit; }
 
-    # Area range
-    areas = []
-    for u in units:
-        raw = u.get('area_raw', '').replace(',', '.').replace('m2','').replace('m²','').strip()
-        try:
-            areas.append(float(raw))
-        except:
-            pass
-    area_min = min(areas) if areas else 0
-    area_max = max(areas) if areas else 0
-    area_str = f'od {area_min:.0f} do {area_max:.0f} m²' if area_min and area_max else ''
+$units         = $data['units'];
+$inv           = $data['inv'];
+$parent_id     = (int)$data['parent_id'];
+$projekt_tid   = (int)$data['projekt_term_id'];
+$label_tid     = 181; // Rynek Pierwotny
 
-    # Rooms range
-    rooms = set()
-    for u in units:
-        r = str(u.get('rooms', '')).strip()
-        if r and r.isdigit():
-            rooms.add(int(r))
-    if rooms:
-        rmin, rmax = min(rooms), max(rooms)
-        if rmin == rmax:
-            room_str = f'{rmin} {"pokój" if rmin == 1 else "pokoje" if rmin < 5 else "pokoi"}'
-        else:
-            room_str = f'{rmin}–{rmax} pokoi'
-    else:
-        room_str = ''
+$status_map = [
+    'dostępne'      => 'wolny',
+    'dostepne'      => 'wolny',
+    'wolne'         => 'wolny',
+    'zarezerwowane' => 'zarezerwowany',
+    'rezerwacja'    => 'zarezerwowany',
+    'sprzedane'     => 'sprzedany',
+    'sprzedany'     => 'sprzedany',
+];
 
-    # Floor range
-    floors = set()
-    for u in units:
-        fl = str(u.get('floor', '')).strip()
-        if fl.isdigit():
-            floors.add(int(fl))
-        elif fl.lower() in ('parter', '0', 'ground'):
-            floors.add(0)
-    floor_max = max(floors) if floors else 0
+$created = $updated = $skipped = 0;
+$errors  = [];
 
-    # Cena od
-    price_raw = inv.get('price_from_raw', '')
-    # Take just "od X PLN" — strip "do ..." part
-    price_clean = re.sub(r'\s*do\s+.+', '', price_raw).strip()
-    price_clean = re.sub(r'^od\s+', '', price_clean, flags=re.I).strip()
+foreach ($units as $u) {
+    $uid = trim($u['realestate_id'] ?? '');
+    if (!$uid) { $skipped++; continue; }
 
-    # Status
-    statuses = set(u.get('status', '').lower() for u in units)
-    if 'dostępne' in statuses:
-        status = 'dostepne'
-    elif 'w budowie' in ' '.join(statuses):
-        status = 'w_budowie'
-    else:
-        status = 'w_budowie'
+    // ── Find existing property post ──────────────────────────────────────
+    $existing = get_posts([
+        'post_type'      => 'property',
+        'meta_key'       => 'expro_unit_id',
+        'meta_value'     => $uid,
+        'posts_per_page' => 1,
+        'fields'         => 'ids',
+        'post_status'    => 'any',
+    ]);
 
-    # Count available
-    available = sum(1 for u in units if 'dostępn' in u.get('status','').lower())
-    total = len(units)
+    $unit_name = trim($u['name'] ?? $u['Nazwa'] ?? $uid);
+    $title     = $unit_name . ' — ' . $inv['name'];
 
-    return {
-        'pow_mieszkalna': area_str,
-        'pokoje': room_str,
-        'floor_max': floor_max,
-        'cena_od': price_clean,
-        'status': status,
-        'liczba_lokali': str(total),
-        'available': available,
+    // ── Price ────────────────────────────────────────────────────────────
+    $price_raw = $u['price_raw'] ?? $u['Cena'] ?? '';
+    $price     = preg_replace('/[^\d]/', '', strtok($price_raw, ','));
+
+    // ── Price per m² ─────────────────────────────────────────────────────
+    $pm2_raw  = $u['price_m2_raw'] ?? $u['Cena m2'] ?? '';
+    preg_match('/[\d\s]+/', str_replace(',', '.', $pm2_raw), $pm2m);
+    $price_m2 = $pm2m ? preg_replace('/\s/', '', $pm2m[0]) : '';
+
+    // ── Area ─────────────────────────────────────────────────────────────
+    $area_raw = $u['area_raw'] ?? $u['Powierzchnia'] ?? '';
+    preg_match('/[\d,\.]+/', $area_raw, $am);
+    $area = $am ? str_replace(',', '.', $am[0]) : '';
+
+    // ── Rooms ────────────────────────────────────────────────────────────
+    $rooms = (string)($u['rooms'] ?? $u['Pokoje'] ?? '');
+
+    // ── Floor display ────────────────────────────────────────────────────
+    $floor_raw = (string)($u['floor'] ?? $u['Piętro'] ?? '');
+    if ($floor_raw === '0' || strtolower($floor_raw) === 'parter') {
+        $floor_disp = 'Parter';
+        $floor_num  = '0';
+    } elseif (is_numeric($floor_raw)) {
+        $floor_disp = 'Piętro ' . $floor_raw;
+        $floor_num  = $floor_raw;
+    } else {
+        $floor_disp = $floor_raw;
+        $floor_num  = '';
     }
 
-def build_projekt_cechy(inv: dict) -> str:
-    """Build projekt_cechy JSON for page-inwestycja-mieszkania.php (format: [{title, desc}])."""
-    desc = inv.get('description', {})
-    cechy = []
-    mapping = [
-        ('udogodnienia',    'Udogodnienia'),
-        ('bezpieczenstwo',  'Bezpieczeństwo'),
-        ('komunikacja',     'Komunikacja'),
-        ('garaz',           'Garaż / Parking'),
-        ('przynaleznosci',  'Przynależności'),
-        ('odleglosc_centrum', 'Odległość od centrum'),
-    ]
-    for key, label in mapping:
-        val = desc.get(key, '').strip()
-        if val:
-            cechy.append({'title': label, 'desc': val})
-    return json.dumps(cechy, ensure_ascii=False) if cechy else ''
+    // ── Delivery ─────────────────────────────────────────────────────────
+    $delivery = $u['delivery'] ?? $inv['delivery'] ?? '';
 
+    // ── Status → taxonomy slug ───────────────────────────────────────────
+    $status_key  = strtolower(trim($u['status'] ?? $u['Status'] ?? 'dostępne'));
+    $status_slug = $status_map[$status_key] ?? 'wolny';
 
-def units_to_expro_json(units: list) -> str:
-    """Convert scraped units to template-compatible format (capitalized keys)."""
-    out = []
-    for u in units:
-        if not _is_apartment_unit(u):
-            continue
-        floor = str(u.get('floor', ''))
-        floor_disp = 'Parter' if floor in ('0', 'parter') else (f'Piętro {floor}' if floor.isdigit() else floor)
-        area = u.get('area_raw', '').replace(' m2', ' m²').replace('m2', ' m²')
-        price = u.get('price_raw', '').replace(' PLN', ' zł').replace(',00', '')
-        price_m2 = u.get('price_m2_raw', '').replace(' PLN/m2', ' zł/m²').replace(',00', '')
-        entry = {
-            'Nazwa': u.get('name', ''),
-            'Piętro': floor_disp,
-            'Pokoje': u.get('rooms', ''),
-            'Powierzchnia': area,
-            'Status': u.get('status', ''),
-            'Termin oddania': u.get('delivery', ''),
-            'Cena': price,
-            'Cena m2': price_m2,
-            'realestate_id': u.get('realestate_id', ''),
+    // ── Type → taxonomy slug ─────────────────────────────────────────────
+    $typ      = strtolower($u['Typ'] ?? $u['type'] ?? '');
+    $type_slug = 'mieszkanie';
+    if (strpos($typ, 'lokal') !== false || strpos($typ, 'biuro') !== false) {
+        $type_slug = 'lokal-uzytkowy';
+    } elseif (strpos($typ, 'blizniak') !== false || strpos($typ, 'bliźniak') !== false) {
+        $type_slug = 'blizniak';
+    } elseif (strpos($typ, 'szereg') !== false) {
+        $type_slug = 'dom-szeregowy';
+    } elseif (strpos($typ, 'wolnostoj') !== false) {
+        $type_slug = 'dom-wolnostojacy';
+    } elseif (strpos($typ, 'dom') !== false) {
+        $type_slug = 'dom-szeregowy';
+    }
+
+    // ── Create or update post ────────────────────────────────────────────
+    if (!empty($existing)) {
+        $post_id = (int)$existing[0];
+        wp_update_post(['ID' => $post_id, 'post_title' => $title, 'post_status' => 'publish']);
+        $updated++;
+    } else {
+        $slug_base = sanitize_title($unit_name . '-' . $inv['expro_id']);
+        $post_id   = wp_insert_post([
+            'post_title'  => $title,
+            'post_name'   => 'lokal-' . $uid,
+            'post_type'   => 'property',
+            'post_status' => 'publish',
+            'post_author' => 1,
+        ]);
+        if (is_wp_error($post_id)) {
+            $errors[] = $uid . ': ' . $post_id->get_error_message();
+            continue;
         }
-        out.append(entry)
-    return json.dumps(out, ensure_ascii=False)
+        $created++;
+    }
 
-def get_or_create_post(ssh: SSHClient, expro_id: str, name: str) -> int:
-    """Find existing WP post by expro_id, or create new one."""
-    try:
-        out = ssh.run_wp_cli(
-            f'post list --post_type=inwestycja --meta_key=expro_id --meta_value={expro_id} '
-            f'--fields=ID --format=csv'
-        )
-        for line in out.strip().splitlines():
-            if line.strip().isdigit():
-                return int(line.strip())
-    except:
-        pass
+    // ── Map address ──────────────────────────────────────────────────────
+    $street  = $inv['street'] ?? '';
+    $city    = $inv['city']   ?? '';
+    $address = trim(($street ? $street . ', ' : '') . $city);
+    $lat     = (string)($inv['lat'] ?? '');
+    $lng     = (string)($inv['lng'] ?? '');
 
-    # Create new post
-    slug = re.sub(r'[^a-z0-9]+', '-', name.lower().strip()).strip('-')[:60]
-    out = ssh.run_wp_cli(
-        f'post create --post_type=inwestycja --post_status=publish '
-        f'--post_title={json.dumps(name)} --post_name={json.dumps(slug)} --porcelain'
+    // ── Meta fields ──────────────────────────────────────────────────────
+    $metas = [
+        'expro_unit_id'             => $uid,
+        'expro_id'                  => (string)$inv['expro_id'],
+        'fave_property_id'          => $uid,
+        'fave_property_price'       => $price,
+        'fave_property_price_postfix' => 'PLN',
+        'fave_property_size'        => $area,
+        'fave_property_rooms'       => $rooms,
+        'fave_property_location'    => $lat,
+        'fave_property_location2'   => $lng,
+        'houzez_geolocation_lat'    => $lat,
+        'houzez_geolocation_long'   => $lng,
+        'fave_property_map_address' => $address,
+        'fave_property_project_id'  => (string)$parent_id,
+        'fave_property_year'        => '',
+        'lokal_pietro'              => $floor_disp,
+        'lokal_pietro_nr'           => $floor_num,
+        'lokal_termin_oddania'      => $delivery,
+        'lokal_cena_m2'             => $price_m2,
+        'lokal_status_expro'        => $status_key,
+    ];
+    foreach ($metas as $k => $v) {
+        update_post_meta($post_id, $k, $v);
+    }
+
+    // ── Taxonomies ───────────────────────────────────────────────────────
+    wp_set_object_terms($post_id, [$label_tid], 'property_label');
+    wp_set_object_terms($post_id, [$status_slug], 'property_status');
+    wp_set_object_terms($post_id, [$type_slug], 'property_type');
+
+    if ($projekt_tid) {
+        wp_set_object_terms($post_id, [$projekt_tid], 'projekt');
+    }
+
+    // property_city — find or create term
+    if ($city) {
+        $ct = term_exists($city, 'property_city');
+        if (!$ct) $ct = wp_insert_term($city, 'property_city');
+        if ($ct && !is_wp_error($ct)) {
+            $ctid = is_array($ct) ? (int)$ct['term_id'] : (int)$ct;
+            wp_set_object_terms($post_id, [$ctid], 'property_city');
+        }
+    }
+}
+
+echo json_encode([
+    'created' => $created,
+    'updated' => $updated,
+    'skipped' => $skipped,
+    'errors'  => $errors,
+]);
+"""
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def get_post_map(ssh: SSHClient) -> dict:
+    """Return {expro_id_str: wp_post_id} for all inwestycja posts."""
+    php = (
+        "<?php\n"
+        "$posts=get_posts(['post_type'=>'inwestycja','posts_per_page'=>-1,'fields'=>'ids','post_status'=>'any']);\n"
+        "foreach($posts as $id){\n"
+        "  $eid=get_post_meta($id,'expro_id',true);\n"
+        "  if($eid) echo $id.','.$eid.\"\\n\";\n"
+        "}\n"
     )
-    post_id = int(out.strip())
-    log(f'  Created post {post_id} for {name}')
-    return post_id
+    ssh.write_remote_file(php, '/tmp/esm_postmap.php')
+    out = ssh.run_wp_cli('eval-file /tmp/esm_postmap.php')
+    result = {}
+    for line in out.strip().splitlines():
+        parts = line.strip().split(',', 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            result[parts[1].strip()] = int(parts[0])
+    return result
 
-# ── Main sync ─────────────────────────────────────────────────────────────────
 
-def sync_investment(ssh: SSHClient, inv: dict) -> int:
-    expro_id = str(inv['expro_id'])
-    name = inv.get('name', f'Inwestycja {expro_id}')
-    log(f'\n{"="*60}')
-    log(f'Syncing [{expro_id}] {name}')
+def get_projekt_term_id(ssh: SSHClient, post_id: int) -> int:
+    """Return projekt taxonomy term ID for a given inwestycja post."""
+    php = (
+        "<?php\n"
+        f"$t=wp_get_post_terms({post_id},'projekt',['fields'=>'ids']);\n"
+        "echo(!is_wp_error($t)&&!empty($t))?$t[0]:'0';\n"
+    )
+    ssh.write_remote_file(php, '/tmp/esm_getterm.php')
+    out = ssh.run_wp_cli('eval-file /tmp/esm_getterm.php')
+    return int(out.strip() or '0')
 
-    post_id = get_or_create_post(ssh, expro_id, name)
-    log(f'  Post ID: {post_id}')
 
-    # Derived apartment meta
-    apt_meta = derive_apartment_meta(inv)
-
-    # Location
-    city = inv.get('city', '')
-    district = inv.get('district', '')
-    street = inv.get('street', '')
-    lokalizacja_parts = [p for p in [street, city] if p]
-    lokalizacja = ', '.join(lokalizacja_parts)
-    tagline_parts = [p for p in [district, city] if p]
-    tagline = ' · '.join(tagline_parts) if tagline_parts else city
-
-    # Delivery + status from delivery text
-    delivery_raw = inv.get('delivery', '')
-    m_del = re.match(r'od\s+(.+?)\s+do\s+\1$', delivery_raw.strip())
-    delivery = m_del.group(1) if m_del else re.sub(r'^od\s+', '', delivery_raw)
-    # Override status based on delivery text
-    delivery_lc = delivery.lower()
-    if re.search(r'oddane|oddano|oddany|gotowe|zamieszkani|zakończ', delivery_lc):
-        apt_meta['status'] = 'gotowe'
-    elif re.search(r'brak|brak danych|—|nieznany', delivery_lc):
-        apt_meta['status'] = 'w_budowie'
-
-    # Cena za m2 from best available unit
+def sync_units(ssh: SSHClient, inv: dict, parent_id: int, projekt_term_id: int) -> tuple[int, int]:
+    """Batch-create/update property posts for all units of an investment."""
     units = inv.get('units', [])
-    m2_prices = []
-    for u in units:
-        raw = u.get('price_m2_raw', '').replace(' PLN/m2', '').replace(',', '.').strip()
-        raw = re.sub(r'\s', '', raw)
-        try:
-            m2_prices.append(float(raw))
-        except:
-            pass
-    cena_m2 = int(sum(m2_prices) / len(m2_prices)) if m2_prices else 0
+    if not units:
+        return 0, 0
 
-    meta_fields = [
-        ('expro_id',              expro_id),
-        ('expro_url',             inv.get('expro_url', '')),
-        ('projekt_typ',           'mieszkanie'),
-        ('projekt_developer',     inv.get('developer', '')),
-        ('projekt_lokalizacja',   lokalizacja),
-        ('projekt_tagline',       tagline),
-        ('projekt_cena_od',       apt_meta['cena_od']),
-        ('projekt_cena_za_m2',    str(cena_m2) if cena_m2 else ''),
-        ('projekt_pow_mieszkalna', apt_meta['pow_mieszkalna']),
-        ('projekt_pokoje',        apt_meta['pokoje']),
-        ('projekt_termin_oddania', delivery),
-        ('projekt_liczba_lokali', apt_meta['liczba_lokali']),
-        ('projekt_status',        apt_meta['status']),
-        ('projekt_lat',           inv.get('lat', '')),
-        ('projekt_lng',           inv.get('lng', '')),
-        # ExPro extra
-        ('expro_winda',           inv.get('extra', {}).get('winda', '')),
-        ('expro_parking',         inv.get('extra', {}).get('miejsce_postojowe', '')),
-        ('expro_komorki',         inv.get('extra', {}).get('komorki_lokatorskie', '')),
-        ('expro_ogrzewanie',      inv.get('extra', {}).get('rodzaj_ogrzewania', '')),
-        ('expro_okna',            inv.get('extra', {}).get('rodzaj_okien', '')),
-        ('expro_forma_wlasnosci', inv.get('extra', {}).get('forma_wlasnosci', '')),
-        ('expro_pod_klucz',       inv.get('extra', {}).get('pod_klucz', '')),
-        ('expro_wielkosc',        inv.get('extra', {}).get('wielkosc_projektu', '')),
-        ('expro_parking_podziemne_cena', inv.get('extra', {}).get('parking_podziemne_cena', '')),
-        ('expro_komorka_cena',    inv.get('extra', {}).get('komorka_cena', '')),
-        ('projekt_subdomain_url', inv.get('developer_url', '')),
-    ]
+    payload = {
+        'units': units,
+        'inv': {
+            'name':     inv.get('name', ''),
+            'expro_id': str(inv.get('expro_id') or inv.get('id', '')),
+            'city':     inv.get('city', ''),
+            'street':   inv.get('street', ''),
+            'district': inv.get('district', ''),
+            'lat':      str(inv.get('lat', '')),
+            'lng':      str(inv.get('lng', '')),
+            'delivery': inv.get('delivery', ''),
+        },
+        'parent_id':      parent_id,
+        'projekt_term_id': projekt_term_id,
+    }
 
-    for key, value in meta_fields:
-        if value:
-            update_meta(ssh, post_id, key, value)
+    data_json = json.dumps(payload, ensure_ascii=False)
+    ssh.write_remote_file(data_json, '/tmp/esm_units_data.json')
+    ssh.write_remote_file(PHP_SYNC_UNITS, '/tmp/esm_sync_units.php')
 
-    # Full investment JSON — page-inwestycja-mieszkania.php reads $extra from here
-    update_meta(ssh, post_id, 'expro_investment_json', json.dumps(inv, ensure_ascii=False))
+    out = ssh.run_wp_cli('eval-file /tmp/esm_sync_units.php')
+    out = out.strip()
 
-    # projekt_cechy JSON for page-inwestycja-mieszkania.php features block
-    cechy_json = build_projekt_cechy(inv)
-    if cechy_json:
-        update_meta(ssh, post_id, 'projekt_cechy', cechy_json)
-
-    # Individual cecha fields (backward compat with single-inwestycja.php)
-    desc = inv.get('description', {})
-    cecha_defs = [
-        ('dashicons-admin-home', 'Udogodnienia',    desc.get('udogodnienia', '')),
-        ('dashicons-shield',     'Bezpieczeństwo',  desc.get('bezpieczenstwo', '')),
-        ('dashicons-car',        'Komunikacja',     desc.get('komunikacja', '')),
-        ('dashicons-admin-home', 'Garaż / Parking', desc.get('garaz', '')),
-    ]
-    for i, (ikona, tytul, opis) in enumerate(cecha_defs, 1):
-        if opis:
-            update_meta(ssh, post_id, f'projekt_cecha_{i}_ikona', ikona)
-            update_meta(ssh, post_id, f'projekt_cecha_{i}_tytul', tytul)
-            update_meta(ssh, post_id, f'projekt_cecha_{i}_opis',  opis)
-
-    # projekt_ogrzewanie (single-inwestycja.php reads this key)
-    ogrzewanie = inv.get('extra', {}).get('rodzaj_ogrzewania', '')
-    if ogrzewanie:
-        update_meta(ssh, post_id, 'projekt_ogrzewanie', ogrzewanie)
-
-    # Units table
-    units_json = units_to_expro_json(units)
-    update_meta(ssh, post_id, 'expro_lokale_json', units_json)
-
-    # Documents
-    docs = inv.get('documents', [])
-    if docs:
-        update_meta(ssh, post_id, 'expro_dokumenty_json',
-                    json.dumps(docs, ensure_ascii=False))
-
-    # Gallery images
-    images = inv.get('images', [])
+    # Parse JSON result
     try:
-        existing_gal = ssh.run_wp_cli(f'post meta get {post_id} projekt_galeria').strip()
-    except:
-        existing_gal = ''
+        result = json.loads(out)
+        if result.get('errors'):
+            for e in result['errors']:
+                log(f'  ERROR: {e}')
+        return result.get('created', 0), result.get('updated', 0)
+    except Exception:
+        log(f'  WARNING: unexpected output: {out[:200]}')
+        return 0, 0
 
-    if images and not existing_gal:
-        log(f'  Importing {len(images)} images...')
-        img_ids = []
-        for url in images:
-            aid = import_image_to_wp(ssh, url, post_id)
-            if aid:
-                img_ids.append(str(aid))
-        if img_ids:
-            update_meta(ssh, post_id, '_thumbnail_id', img_ids[0])
-            update_meta(ssh, post_id, 'projekt_galeria', ','.join(img_ids))
-            log(f'  Gallery: {len(img_ids)} images, featured={img_ids[0]}')
 
-    log(f'  ✓ Done: {name} → post {post_id}')
-    return post_id
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--expro-ids', help='Comma-separated ExPro IDs')
-    parser.add_argument('--all', action='store_true', help='Sync all Mieszkanie investments')
+    parser.add_argument('--expro-ids', help='Comma-separated ExPro IDs to sync')
+    parser.add_argument('--all', action='store_true', help='Sync all investments with units')
     args = parser.parse_args()
 
-    with open(DATA) as f:
-        all_data = json.load(f)
+    if not DATA.exists():
+        log(f'ERROR: {DATA} not found — run scrape first')
+        sys.exit(1)
+
+    all_data = json.loads(DATA.read_text('utf-8'))
 
     if args.expro_ids:
         ids = set(args.expro_ids.split(','))
-        investments = [d for d in all_data if str(d['expro_id']) in ids]
+        investments = [d for d in all_data if str(d.get('expro_id') or d.get('id', '')) in ids]
     elif args.all:
-        investments = [
-            d for d in all_data
-            if any(u.get('type') == 'Mieszkanie' for u in d.get('units', []))
-        ]
+        investments = [d for d in all_data if d.get('units')]
     else:
         parser.print_help()
         return
 
-    log(f'Investments to sync: {len(investments)}')
+    log(f'Investments with units to sync: {len(investments)}')
 
     ssh = SSHClient()
     ssh._connect()
+    log('SSH connected.')
 
-    synced = []
+    # Build expro_id → WP post_id map
+    post_map = get_post_map(ssh)
+    log(f'Found {len(post_map)} inwestycja posts in WP.')
+
+    total_created = total_updated = total_skipped = 0
+
     for inv in investments:
-        pid = sync_investment(ssh, inv)
-        if pid:
-            synced.append(pid)
+        expro_id = str(inv.get('expro_id') or inv.get('id', ''))
+        name     = inv.get('name', expro_id)
+        units    = inv.get('units', [])
 
-    ssh.run_wp_cli('litespeed-purge all')
+        log(f'\n{"="*60}')
+        log(f'[{expro_id}] {name} — {len(units)} units')
+
+        parent_id = post_map.get(expro_id)
+        if not parent_id:
+            log(f'  SKIP: no inwestycja post found for expro_id={expro_id}')
+            total_skipped += 1
+            continue
+
+        log(f'  Parent post: {parent_id}')
+
+        projekt_term_id = get_projekt_term_id(ssh, parent_id)
+        if projekt_term_id:
+            log(f'  Projekt term ID: {projekt_term_id}')
+        else:
+            log(f'  WARNING: no projekt term for post {parent_id}')
+
+        c, u = sync_units(ssh, inv, parent_id, projekt_term_id)
+        log(f'  ✓ {c} created, {u} updated')
+        total_created += c
+        total_updated += u
+
     ssh.close()
+    log(f'\nMieszkania sync complete: {total_created} created, {total_updated} updated, {total_skipped} skipped.')
 
-    log(f'\nDone: {len(synced)} synced')
-    if synced:
-        log(f'Post IDs: {synced}')
 
 if __name__ == '__main__':
     main()
