@@ -89,7 +89,7 @@ def parse_area(raw: str) -> Tuple[Optional[float], Optional[float]]:
 
 def scrape_hash(inv: dict) -> str:
     key = json.dumps(
-        {k: inv.get(k) for k in ["name", "price_from_raw", "delivery", "units_count", "units_available"]},
+        {k: inv.get(k) for k in ["name", "price_from_raw", "delivery", "units_count", "units_available", "zasady_wspolpracy"]},
         ensure_ascii=False,
         sort_keys=True,
     )
