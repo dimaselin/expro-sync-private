@@ -119,7 +119,7 @@ foreach ($units as $u) {
     $bathrooms = (string)($u['bathrooms'] ?? '1');
 
     // ── Garage ───────────────────────────────────────────────────────────
-    $garage = ($u['has_garage'] ?? false) ? '1' : '0';
+    $garage = ($u['has_garage'] ?? false) ? 'Tak' : '';
 
     // ── Floor display ────────────────────────────────────────────────────
     $floor_raw = (string)($u['floor'] ?? $u['Piętro'] ?? '');
@@ -245,6 +245,7 @@ foreach ($units as $u) {
         'fave_property_bedrooms'      => $bedrooms,
         'fave_property_bathrooms'     => $bathrooms,
         'fave_property_garage'        => $garage,
+        'fave_land_area'              => $u['garden_area'] ?? '',
         'fave_property_location'      => $lat,
         'fave_property_location2'     => $lng,
         'houzez_geolocation_lat'      => $lat,
