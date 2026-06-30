@@ -17,6 +17,11 @@ on:
           - mieszkania
           - media
           - pipeline
+      investment_id:
+        description: 'Тест: ExPro ID інвестиції (напр. 7567). Порожньо = всі.'
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: expro-sync
@@ -120,6 +125,8 @@ jobs:
             expro-prev-
 
       - name: Run sync
+        env:
+          EXPRO_TEST_INV_ID: ${{ github.event.inputs.investment_id || '' }}
         run: python3 run.py ${{ github.event.inputs.mode || 'all' }}
 
       - name: Save unit photo cache (expro_prev.json)

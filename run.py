@@ -123,6 +123,15 @@ def run_mode(mode: str) -> bool:
     os.chdir(script_dir)
     wp_start(mode)
 
+    # Test mode: single investment (env var set by workflow input or manually)
+    test_inv = os.environ.get("EXPRO_TEST_INV_ID", "").strip()
+    if test_inv:
+        log(f"TEST MODE: limiting to investment(s): {test_inv}")
+    mieszkania_args = ['--expro-ids', test_inv] if test_inv else ['--all']
+    # import_media and pipeline work on WP post IDs — --all is safe (few posts in test)
+    media_args    = ['--all']
+    pipeline_args = ['--all']
+
     if mode in ('all', 'scrape'):
         log('=== Starting ExPro scrape ===')
         if not _run_script('scraper.py'):
@@ -132,7 +141,7 @@ def run_mode(mode: str) -> bool:
         log('=== Scrape complete ===')
 
     if mode in ('all', 'sync'):
-        log('=== Starting WP sync (domy) ===')
+        log('=== Starting WP sync (inwestycje) ===')
         if not _run_script('wp_sync.py'):
             log('=== WP sync FAILED ===')
             wp_finish(False, {}, error='wp_sync.py exited with error')
@@ -141,7 +150,7 @@ def run_mode(mode: str) -> bool:
 
     if mode in ('all', 'mieszkania'):
         log('=== Starting mieszkania sync ===')
-        if not _run_script('mieszkania_sync.py', ['--all']):
+        if not _run_script('mieszkania_sync.py', mieszkania_args):
             log('=== Mieszkania sync FAILED ===')
             wp_finish(False, {}, error='mieszkania_sync.py exited with error')
             return False
@@ -149,7 +158,7 @@ def run_mode(mode: str) -> bool:
 
     if mode in ('all', 'media'):
         log('=== Starting media import ===')
-        if not _run_script('import_media.py', ['--all']):
+        if not _run_script('import_media.py', media_args):
             log('=== Media import FAILED ===')
             wp_finish(False, {}, error='import_media.py exited with error')
             return False
@@ -157,7 +166,7 @@ def run_mode(mode: str) -> bool:
 
     if mode in ('all', 'pipeline'):
         log('=== Starting enrichment pipeline ===')
-        if not _run_script('pipeline.py', ['--all']):
+        if not _run_script('pipeline.py', pipeline_args):
             log('=== Pipeline FAILED ===')
             wp_finish(False, {}, error='pipeline.py exited with error')
             return False

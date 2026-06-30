@@ -693,6 +693,12 @@ def main():
 
     log(f"Loaded {len(investments)} investments from {data_path}")
 
+    test_id = os.environ.get("EXPRO_TEST_INV_ID", "").strip()
+    if test_id:
+        test_ids = set(test_id.split(","))
+        investments = [i for i in investments if str(i.get("expro_id", "")) in test_ids]
+        log(f"TEST MODE: limiting to {len(investments)} investment(s): {test_id}")
+
     ssh = SSHClient()
     try:
         ssh._connect()

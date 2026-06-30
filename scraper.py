@@ -713,6 +713,17 @@ def main():
             browser.close()
             sys.exit(1)
 
+        # Test mode: limit to specific investment(s)
+        test_id = os.environ.get("EXPRO_TEST_INV_ID", "").strip()
+        if test_id:
+            test_ids = set(test_id.split(","))
+            inv_ids = [i for i in inv_ids if i in test_ids]
+            log(f"TEST MODE: limiting to inv_ids={inv_ids}")
+            if not inv_ids:
+                log(f"ERROR: EXPRO_TEST_INV_ID={test_id} not found in listings.")
+                browser.close()
+                sys.exit(1)
+
         # Build known_unit_photos from previous scrape to skip already-scraped unit detail pages
         known_unit_photos: dict[str, dict] = {}
         prev_path = Path("data/expro_prev.json")
