@@ -171,7 +171,7 @@ def collect_investment_ids(page) -> list[str]:
 # Scrape single investment detail page
 # ---------------------------------------------------------------------------
 
-def scrape_detail(page, inv_id: str) -> Optional[dict]:
+def scrape_detail(page, inv_id: str, known_unit_photos: dict | None = None) -> Optional[dict]:
     url = f"{BASE_URL}/investments/viewdetails/id/{inv_id}/"
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=45_000)
@@ -489,8 +489,8 @@ def scrape_detail(page, inv_id: str) -> Optional[dict]:
             "href": doc_href,
         })
 
-    # ── per-lokal realestate_id ───────────────────────────────────────────────
-    realestate_pat = re.compile(r"/realestate/index/create-offer-file/realestate_id/(\d+)/")
+    # ── Phase 1: extract realestate_id from each unit row ────────────────────
+    realestate_pat = re.compile(r"/realestate/index/(?:create-offer-file|view)/realestate_id/(\d+)/")
     if units_table:
         data_rows = [r for r in units_table.query_selector_all("tr") if r.query_selector_all("td")]
         for i, unit in enumerate(units):
@@ -499,6 +499,67 @@ def scrape_detail(page, inv_id: str) -> Optional[dict]:
                 rid_m = realestate_pat.search(row_html)
                 if rid_m:
                     unit["realestate_id"] = rid_m.group(1)
+
+    # ── Phase 2: scrape unit detail pages for photo + floor plan ─────────────
+    # Uses a separate browser tab to avoid re-navigating the investment page.
+    # Skips units whose photos/plans are already known from previous scrape.
+    if known_unit_photos is None:
+        known_unit_photos = {}
+    ctx = page.context
+    for unit in units:
+        rid = unit.get("realestate_id", "")
+        if not rid:
+            continue
+        # Reuse photos from previous scrape if available
+        if rid in known_unit_photos:
+            cached = known_unit_photos[rid]
+            if cached.get("photo_urls"):
+                unit["photo_urls"] = cached["photo_urls"]
+            if cached.get("plan_urls"):
+                unit["plan_urls"] = cached["plan_urls"]
+            continue
+        detail_url = f"{BASE_URL}/realestate/index/view/realestate_id/{rid}/"
+        try:
+            tab = ctx.new_page()
+            tab.goto(detail_url, wait_until="domcontentloaded", timeout=20_000)
+            unit_imgs:  list[str] = []
+            unit_plans: list[str] = []
+            for img_el in tab.query_selector_all("img"):
+                src = (img_el.get_attribute("src") or "").strip()
+                if not src:
+                    continue
+                if src.startswith("//"):
+                    src = "https:" + src
+                elif src.startswith("/"):
+                    src = BASE_URL + src
+                if "/files/" not in src.lower():
+                    continue
+                if any(k in src.lower() for k in ["plan", "rzut", "floor"]):
+                    unit_plans.append(src)
+                else:
+                    unit_imgs.append(src)
+            # PDF or image plan links
+            for a_el in tab.query_selector_all("a[href]"):
+                href = (a_el.get_attribute("href") or "").strip()
+                txt  = a_el.inner_text().strip().lower()
+                if not href:
+                    continue
+                if href.startswith("/"):
+                    href = BASE_URL + href
+                if any(k in txt for k in ["plan", "rzut"]) or \
+                   any(k in href.lower() for k in ["plan", "rzut"]):
+                    if href not in unit_plans:
+                        unit_plans.append(href)
+            if unit_imgs:
+                unit["photo_urls"] = unit_imgs
+            if unit_plans:
+                unit["plan_urls"] = unit_plans
+            tab.close()
+        except Exception:
+            try:
+                tab.close()
+            except Exception:
+                pass
 
     # ── zasady współpracy (commission terms) ─────────────────────────────────
     zasady: dict[str, str] = {}
@@ -606,13 +667,31 @@ def main():
             browser.close()
             sys.exit(1)
 
+        # Build known_unit_photos from previous scrape to skip already-scraped unit detail pages
+        known_unit_photos: dict[str, dict] = {}
+        prev_path = Path("data/expro_prev.json")
+        if prev_path.exists():
+            try:
+                prev_data = json.loads(prev_path.read_text("utf-8"))
+                for prev_inv in prev_data:
+                    for pu in prev_inv.get("units", []):
+                        rid = pu.get("realestate_id", "")
+                        if rid and (pu.get("photo_urls") or pu.get("plan_urls")):
+                            known_unit_photos[rid] = {
+                                "photo_urls": pu.get("photo_urls", []),
+                                "plan_urls":  pu.get("plan_urls",  []),
+                            }
+                log(f"Cached unit photos/plans from prev scrape: {len(known_unit_photos)} units")
+            except Exception as e:
+                log(f"WARNING: could not load prev data for photo cache — {e}")
+
         # Scrape each detail page
         results: list[dict] = []
         total = len(inv_ids)
         for idx, inv_id in enumerate(inv_ids, 1):
             log(f"Scraping {idx}/{total}: ID={inv_id} …")
             try:
-                inv = scrape_detail(page, inv_id)
+                inv = scrape_detail(page, inv_id, known_unit_photos)
                 if inv:
                     results.append(inv)
                     log(f"  OK — {inv['name']}")

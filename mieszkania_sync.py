@@ -207,6 +207,50 @@ foreach ($units as $u) {
             wp_set_object_terms($post_id, [$ctid], 'property_city');
         }
     }
+
+    // ── Year from delivery ───────────────────────────────────────────────
+    preg_match('/\b(20\d{2})\b/', $delivery, $ym);
+    if ($ym) update_post_meta($post_id, 'fave_property_year', $ym[1]);
+
+    // ── Photo — sideload first photo_url, fallback to parent thumbnail ──
+    if (!has_post_thumbnail($post_id)) {
+        if (!function_exists('media_sideload_image')) {
+            require_once ABSPATH . 'wp-admin/includes/media.php';
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+            require_once ABSPATH . 'wp-admin/includes/image.php';
+        }
+        $sideloaded = false;
+        $photo_url = $u['photo_urls'][0] ?? '';
+        if ($photo_url) {
+            $att_id = media_sideload_image($photo_url, $post_id, null, 'id');
+            if (!is_wp_error($att_id)) {
+                set_post_thumbnail($post_id, $att_id);
+                $sideloaded = true;
+            }
+        }
+        // fallback: reuse parent investment's featured image
+        if (!$sideloaded && $parent_id) {
+            $parent_thumb = get_post_thumbnail_id($parent_id);
+            if ($parent_thumb) set_post_thumbnail($post_id, $parent_thumb);
+        }
+    }
+
+    // ── Floor plan — sideload first plan_url ────────────────────────────
+    $plan_url = $u['plan_urls'][0] ?? '';
+    if ($plan_url && !get_post_meta($post_id, 'lokal_plan_attachment_id', true)) {
+        if (!function_exists('media_sideload_image')) {
+            require_once ABSPATH . 'wp-admin/includes/media.php';
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+            require_once ABSPATH . 'wp-admin/includes/image.php';
+        }
+        $plan_att = media_sideload_image($plan_url, $post_id, null, 'id');
+        if (!is_wp_error($plan_att)) {
+            update_post_meta($post_id, 'lokal_plan_attachment_id', (string)$plan_att);
+        } else {
+            // store URL as fallback even if sideload fails (needs auth)
+            update_post_meta($post_id, 'lokal_plan_url_expro', $plan_url);
+        }
+    }
 }
 
 echo json_encode([
