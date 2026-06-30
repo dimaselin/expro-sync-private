@@ -529,8 +529,12 @@ def scrape_detail(page, inv_id: str, known_unit_photos: dict | None = None) -> O
         if not action_links:
             continue
 
-        unit_imgs:  list[str] = []
-        unit_plans: list[str] = []
+        unit_imgs:      list[str] = []
+        unit_plans:     list[str] = []
+        photo_url_map:  dict[str, str] = {}  # url → local_path (downloaded ok)
+        plan_url_map:   dict[str, str] = {}
+        img_dir = Path(f"data/images/{rid}")
+        img_dir.mkdir(parents=True, exist_ok=True)
         for link_url in action_links:
             tab = None
             try:
@@ -546,12 +550,28 @@ def scrape_detail(page, inv_id: str, known_unit_photos: dict | None = None) -> O
                         src = BASE_URL + src
                     if "/files/" not in src.lower():
                         continue
-                    if any(k in src.lower() for k in ["plan", "rzut"]):
-                        if src not in unit_plans:
-                            unit_plans.append(src)
+                    is_plan = any(k in src.lower() for k in ["plan", "rzut"])
+                    target_list = unit_plans if is_plan else unit_imgs
+                    url_map    = plan_url_map if is_plan else photo_url_map
+                    prefix     = "plan" if is_plan else "photo"
+                    if src in target_list:
+                        continue
+                    target_list.append(src)
+                    idx = len(target_list) - 1
+                    local_path = img_dir / f"{prefix}_{idx}.jpg"
+                    # Download using authenticated Playwright session
+                    if local_path.exists():
+                        url_map[src] = str(local_path)
                     else:
-                        if src not in unit_imgs:
-                            unit_imgs.append(src)
+                        try:
+                            resp = tab.context.request.get(src)
+                            if resp.ok:
+                                local_path.write_bytes(resp.body())
+                                url_map[src] = str(local_path)
+                            else:
+                                log(f"    WARN: {src} → HTTP {resp.status}")
+                        except Exception as dl_err:
+                            log(f"    WARN: download failed {src}: {dl_err}")
 
                 # Parse page text for unit-level attributes
                 try:
@@ -606,6 +626,10 @@ def scrape_detail(page, inv_id: str, known_unit_photos: dict | None = None) -> O
             unit["photo_urls"] = unit_imgs
         if unit_plans:
             unit["plan_urls"] = unit_plans
+        if photo_url_map:
+            unit["photo_url_map"] = photo_url_map
+        if plan_url_map:
+            unit["plan_url_map"] = plan_url_map
 
     # ── zasady współpracy (commission terms) ─────────────────────────────────
     zasady: dict[str, str] = {}

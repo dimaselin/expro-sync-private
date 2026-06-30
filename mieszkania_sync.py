@@ -331,12 +331,13 @@ foreach ($units as $u) {
     }
 
     // ── Photos: full gallery + thumbnail ─────────────────────────────────
-    $photo_urls  = $u['photo_urls'] ?? [];
-    $gallery_ids = (array)(get_post_meta($post_id, 'fave_property_images', true) ?: []);
+    $photo_urls       = $u['photo_urls']       ?? [];
+    $photo_server_map = $u['photo_server_map'] ?? [];  // url → /tmp/esm_imgs/{rid}/photo_N.jpg
+    $gallery_ids      = (array)(get_post_meta($post_id, 'fave_property_images', true) ?: []);
 
     foreach ($photo_urls as $img_url) {
         if (!$img_url) continue;
-        // Skip if already imported (check by source URL in attachment meta)
+        // Check if already imported
         $existing_att = get_posts([
             'post_type'      => 'attachment',
             'meta_key'       => '_source_url',
@@ -346,7 +347,14 @@ foreach ($units as $u) {
         ]);
         if ($existing_att) {
             $att_id = (int)$existing_att[0];
+        } elseif (!empty($photo_server_map[$img_url]) && file_exists($photo_server_map[$img_url])) {
+            // Import from local file (downloaded by scraper with auth)
+            $tmp = tempnam(sys_get_temp_dir(), 'esm_');
+            copy($photo_server_map[$img_url], $tmp);
+            $file_array = ['name' => basename($photo_server_map[$img_url]), 'tmp_name' => $tmp];
+            $att_id = media_handle_sideload($file_array, $post_id);
         } else {
+            // Fallback: try remote URL (may fail without ExPro auth)
             $att_id = media_sideload_image($img_url, $post_id, null, 'id');
         }
         if (!is_wp_error($att_id)) {
@@ -369,7 +377,8 @@ foreach ($units as $u) {
     }
 
     // ── Floor plan ───────────────────────────────────────────────────────
-    $plan_url = $u['plan_urls'][0] ?? '';
+    $plan_url        = $u['plan_urls'][0] ?? '';
+    $plan_server_map = $u['plan_server_map'] ?? [];
     if ($plan_url && !get_post_meta($post_id, 'lokal_plan_attachment_id', true)) {
         $existing_plan = get_posts([
             'post_type'      => 'attachment',
@@ -380,6 +389,11 @@ foreach ($units as $u) {
         ]);
         if ($existing_plan) {
             $plan_att = (int)$existing_plan[0];
+        } elseif (!empty($plan_server_map[$plan_url]) && file_exists($plan_server_map[$plan_url])) {
+            $tmp = tempnam(sys_get_temp_dir(), 'esm_plan_');
+            copy($plan_server_map[$plan_url], $tmp);
+            $file_array = ['name' => basename($plan_server_map[$plan_url]), 'tmp_name' => $tmp];
+            $plan_att = media_handle_sideload($file_array, $post_id);
         } else {
             $plan_att = media_sideload_image($plan_url, $post_id, null, 'id');
         }
@@ -434,6 +448,49 @@ def get_projekt_term_id(ssh: SSHClient, post_id: int) -> int:
     return int(out.strip() or '0')
 
 
+def upload_unit_images(ssh: SSHClient, units: list[dict], server_base: str = '/tmp/esm_imgs') -> None:
+    """SFTP-upload locally downloaded unit images to WP server before PHP import."""
+    files_to_upload = []
+    for unit in units:
+        rid = unit.get('realestate_id', '')
+        if not rid:
+            continue
+        for url, local in {**unit.get('photo_url_map', {}), **unit.get('plan_url_map', {})}.items():
+            if local and Path(local).exists():
+                files_to_upload.append((rid, url, local))
+
+    if not files_to_upload:
+        return
+
+    sftp = ssh._client.open_sftp()
+    try:
+        try:
+            sftp.mkdir(server_base)
+        except IOError:
+            pass
+        dirs_created: set = set()
+        for rid, url, local in files_to_upload:
+            rid_dir = f"{server_base}/{rid}"
+            if rid_dir not in dirs_created:
+                try:
+                    sftp.mkdir(rid_dir)
+                except IOError:
+                    pass
+                dirs_created.add(rid_dir)
+            remote_path = f"{rid_dir}/{Path(local).name}"
+            sftp.put(local, remote_path)
+            # Augment unit with server path mapped to URL
+            for unit in units:
+                if unit.get('realestate_id') == rid:
+                    if url in unit.get('photo_url_map', {}):
+                        unit.setdefault('photo_server_map', {})[url] = remote_path
+                    elif url in unit.get('plan_url_map', {}):
+                        unit.setdefault('plan_server_map', {})[url] = remote_path
+    finally:
+        sftp.close()
+    log(f'  Uploaded {len(files_to_upload)} image files to server')
+
+
 def sync_units(ssh: SSHClient, inv: dict, parent_id: int, projekt_term_id: int) -> tuple[int, int]:
     """Batch-create/update property posts for all units of an investment."""
     units = inv.get('units', [])
@@ -457,12 +514,18 @@ def sync_units(ssh: SSHClient, inv: dict, parent_id: int, projekt_term_id: int) 
         'projekt_term_id': projekt_term_id,
     }
 
+    # Upload unit images to server (authenticated download already done by scraper)
+    upload_unit_images(ssh, units)
+
     data_json = json.dumps(payload, ensure_ascii=False)
     ssh.write_remote_file(data_json, '/tmp/esm_units_data.json')
     ssh.write_remote_file(PHP_SYNC_UNITS, '/tmp/esm_sync_units.php')
 
     out = ssh.run_wp_cli('eval-file /tmp/esm_sync_units.php')
     out = out.strip()
+
+    # Cleanup server image temp files
+    ssh._client.exec_command('rm -rf /tmp/esm_imgs')
 
     # Parse JSON result
     try:
