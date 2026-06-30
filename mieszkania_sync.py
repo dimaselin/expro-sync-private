@@ -330,43 +330,18 @@ foreach ($units as $u) {
         }
     }
 
-    // ── Photos: full gallery + thumbnail ─────────────────────────────────
-    $photo_urls       = $u['photo_urls']       ?? [];
-    $photo_server_map = $u['photo_server_map'] ?? [];  // url → /tmp/esm_imgs/{rid}/photo_N.jpg
-    $gallery_ids      = (array)(get_post_meta($post_id, 'fave_property_images', true) ?: []);
-
-    foreach ($photo_urls as $img_url) {
-        if (!$img_url) continue;
-        // Check if already imported
-        $existing_att = get_posts([
-            'post_type'      => 'attachment',
-            'meta_key'       => '_source_url',
-            'meta_value'     => $img_url,
-            'posts_per_page' => 1,
-            'fields'         => 'ids',
-        ]);
-        if ($existing_att) {
-            $att_id = (int)$existing_att[0];
-        } elseif (!empty($photo_server_map[$img_url]) && file_exists($photo_server_map[$img_url])) {
-            // Import from local file (downloaded by scraper with auth)
-            $tmp = tempnam(sys_get_temp_dir(), 'esm_');
-            copy($photo_server_map[$img_url], $tmp);
-            $file_array = ['name' => basename($photo_server_map[$img_url]), 'tmp_name' => $tmp];
-            $att_id = media_handle_sideload($file_array, $post_id);
-        } else {
-            // Fallback: try remote URL (may fail without ExPro auth)
-            $att_id = media_sideload_image($img_url, $post_id, null, 'id');
-        }
-        if (!is_wp_error($att_id)) {
-            update_post_meta($att_id, '_source_url', $img_url);
-            if (!in_array($att_id, $gallery_ids)) {
-                $gallery_ids[] = $att_id;
-            }
+    // ── Photos: floor plan + 1-2 investment photos ───────────────────────
+    // Gallery = [plan_att (if exists)] + up to 2 photos from parent investment
+    $gallery_ids = (array)(get_post_meta($post_id, 'fave_property_images', true) ?: []);
+    if (!$gallery_ids) {
+        $inv_gallery = (array)(get_post_meta($parent_id, 'projekt_galeria', true) ?: []);
+        if ($inv_gallery) {
+            $gallery_ids = array_slice($inv_gallery, 0, 2);
+            update_post_meta($post_id, 'fave_property_images', $gallery_ids);
         }
     }
 
     if ($gallery_ids) {
-        update_post_meta($post_id, 'fave_property_images', $gallery_ids);
         if (!has_post_thumbnail($post_id)) {
             set_post_thumbnail($post_id, $gallery_ids[0]);
         }
@@ -449,13 +424,15 @@ def get_projekt_term_id(ssh: SSHClient, post_id: int) -> int:
 
 
 def upload_unit_images(ssh: SSHClient, units: list[dict], server_base: str = '/tmp/esm_imgs') -> None:
-    """SFTP-upload locally downloaded unit images to WP server before PHP import."""
+    """SFTP-upload unit floor plan images to WP server before PHP import.
+    Gallery photos are taken from investment-level projekt_galeria — no upload needed."""
     files_to_upload = []
     for unit in units:
         rid = unit.get('realestate_id', '')
         if not rid:
             continue
-        for url, local in {**unit.get('photo_url_map', {}), **unit.get('plan_url_map', {})}.items():
+        # Only upload plan images (not gallery photos — those come from parent investment)
+        for url, local in unit.get('plan_url_map', {}).items():
             if local and Path(local).exists():
                 files_to_upload.append((rid, url, local))
 
@@ -479,13 +456,10 @@ def upload_unit_images(ssh: SSHClient, units: list[dict], server_base: str = '/t
                 dirs_created.add(rid_dir)
             remote_path = f"{rid_dir}/{Path(local).name}"
             sftp.put(local, remote_path)
-            # Augment unit with server path mapped to URL
+            # Augment unit with server path for plan
             for unit in units:
                 if unit.get('realestate_id') == rid:
-                    if url in unit.get('photo_url_map', {}):
-                        unit.setdefault('photo_server_map', {})[url] = remote_path
-                    elif url in unit.get('plan_url_map', {}):
-                        unit.setdefault('plan_server_map', {})[url] = remote_path
+                    unit.setdefault('plan_server_map', {})[url] = remote_path
     finally:
         sftp.close()
     log(f'  Uploaded {len(files_to_upload)} image files to server')
