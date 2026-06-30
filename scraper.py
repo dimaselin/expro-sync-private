@@ -722,7 +722,7 @@ def main():
                 for prev_inv in prev_data:
                     for pu in prev_inv.get("units", []):
                         rid = pu.get("realestate_id", "")
-                        if rid and (pu.get("photo_urls") or pu.get("plan_urls")):
+                        if rid:
                             known_unit_photos[rid] = {
                                 "photo_urls": pu.get("photo_urls", []),
                                 "plan_urls":  pu.get("plan_urls",  []),
@@ -749,19 +749,18 @@ def main():
 
         browser.close()
 
-    # Rotate: current data → prev (used as photo cache on next run)
+    import shutil
     out_path  = Path(DATA_FILE)
     prev_path = Path("data/expro_prev.json")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.exists():
-        import shutil
-        shutil.copy2(out_path, prev_path)
-        log(f"Rotated previous data → {prev_path}")
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
-
     log(f"Saved {len(results)} investments to {out_path}")
+
+    # Copy NEW data → prev (photo cache for next run)
+    shutil.copy2(out_path, prev_path)
+    log(f"Updated photo cache → {prev_path}")
 
 
 if __name__ == "__main__":
