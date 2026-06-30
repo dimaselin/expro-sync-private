@@ -552,6 +552,48 @@ def scrape_detail(page, inv_id: str, known_unit_photos: dict | None = None) -> O
                     else:
                         if src not in unit_imgs:
                             unit_imgs.append(src)
+
+                # Parse page text for unit-level attributes
+                try:
+                    pg_text = tab.inner_text("body")
+                    for line in pg_text.splitlines():
+                        line = line.strip()
+                        if ":" not in line or len(line) > 300:
+                            continue
+                        lbl, _, val = line.partition(":")
+                        lbl_l = lbl.strip().lower()
+                        val_s = val.strip()
+                        val_l = val_s.lower()
+                        if not val_s or val_l in ["nie", "n/d", "-", "brak", "0", ""]:
+                            continue
+                        area_m = re.search(r"([\d,\.]+)\s*m", val_s)
+                        if "balkon" in lbl_l:
+                            unit.setdefault("has_balcony", True)
+                            if area_m:
+                                unit["balcony_area"] = area_m.group(1).replace(",", ".")
+                        elif "taras" in lbl_l:
+                            unit.setdefault("has_terrace", True)
+                            if area_m:
+                                unit["terrace_area"] = area_m.group(1).replace(",", ".")
+                        elif "ogród" in lbl_l or "ogrodek" in lbl_l:
+                            unit.setdefault("has_garden", True)
+                            if area_m:
+                                unit["garden_area"] = area_m.group(1).replace(",", ".")
+                        elif "garaż" in lbl_l or "garaz" in lbl_l:
+                            unit.setdefault("has_garage", True)
+                        elif "piwnic" in lbl_l or "komórka" in lbl_l or "komorka" in lbl_l:
+                            unit.setdefault("has_basement", True)
+                        elif "sypialn" in lbl_l:
+                            num_m = re.search(r"\d+", val_s)
+                            if num_m:
+                                unit.setdefault("bedrooms", num_m.group(0))
+                        elif "łazienk" in lbl_l or "wc" in lbl_l:
+                            num_m = re.search(r"\d+", val_s)
+                            if num_m:
+                                unit.setdefault("bathrooms", num_m.group(0))
+                except Exception:
+                    pass
+
                 tab.close()
             except Exception:
                 if tab:
