@@ -508,6 +508,13 @@ def scrape_detail(page, inv_id: str, known_unit_photos: dict | None = None) -> O
                         action_links.append(href)
                 if action_links:
                     unit["_action_links"] = action_links
+                elif unit.get("realestate_id"):
+                    # fallback: construct view URL from realestate_id
+                    rid = unit["realestate_id"]
+                    unit["_action_links"] = [f"{BASE_URL}/realestate/view/realestate_id/{rid}/"]
+
+    units_with_links = sum(1 for u in units if u.get("_action_links"))
+    log(f"  Phase 1: {units_with_links}/{len(units)} units have action links")
 
     # ── Phase 2: navigate action links to get per-unit photos + floor plans ───
     if known_unit_photos is None:
@@ -574,10 +581,22 @@ def scrape_detail(page, inv_id: str, known_unit_photos: dict | None = None) -> O
             try:
                 tab = ctx.new_page()
                 tab.goto(link_url, wait_until="domcontentloaded", timeout=20_000)
+                log(f"    [{rid}] action page: {link_url}")
+
+                # Collect candidate URLs: img[src] + a[href] pointing to /files/
+                candidate_urls: list[str] = []
                 for img_el in tab.query_selector_all("img"):
                     src = (img_el.get_attribute("src") or "").strip()
-                    if not src:
-                        continue
+                    if src:
+                        candidate_urls.append(src)
+                for a_el in tab.query_selector_all("a[href]"):
+                    href = (a_el.get_attribute("href") or "").strip()
+                    # include links to image files and PDFs that may be floor plans
+                    if href and any(href.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".pdf"]):
+                        candidate_urls.append(href)
+
+                found_on_page = 0
+                for src in candidate_urls:
                     if src.startswith("//"):
                         src = "https:" + src
                     elif src.startswith("/"):
@@ -591,6 +610,7 @@ def scrape_detail(page, inv_id: str, known_unit_photos: dict | None = None) -> O
                     if src in target_list:
                         continue
                     target_list.append(src)
+                    found_on_page += 1
                     idx = len(target_list) - 1
                     local_path = img_dir / f"{prefix}_{idx}.jpg"
                     # Download using authenticated Playwright session
@@ -606,6 +626,17 @@ def scrape_detail(page, inv_id: str, known_unit_photos: dict | None = None) -> O
                                 log(f"    WARN: {src} → HTTP {resp.status}")
                         except Exception as dl_err:
                             log(f"    WARN: download failed {src}: {dl_err}")
+                if found_on_page == 0:
+                    # Log all /files/ URLs for diagnosis when nothing found
+                    all_srcs = [
+                        (el.get_attribute("src") or el.get_attribute("href") or "")
+                        for el in tab.query_selector_all("img, a[href]")
+                    ]
+                    files_srcs = [s for s in all_srcs if "/files/" in s.lower()]
+                    if files_srcs:
+                        log(f"    [{rid}] /files/ found but none matched filter: {files_srcs[:3]}")
+                    else:
+                        log(f"    [{rid}] no /files/ URLs on page (imgs={len(tab.query_selector_all('img'))})")
 
                 # Parse page text for unit-level attributes
                 try:
