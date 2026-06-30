@@ -330,14 +330,17 @@ foreach ($units as $u) {
         }
     }
 
-    // ── Photos: floor plan + 1-2 investment photos ───────────────────────
-    // Gallery = [plan_att (if exists)] + up to 2 photos from parent investment
+    // ── Photos: 1-2 investment photos as unit gallery ────────────────────
     $gallery_ids = (array)(get_post_meta($post_id, 'fave_property_images', true) ?: []);
     if (!$gallery_ids) {
-        $inv_gallery = (array)(get_post_meta($parent_id, 'projekt_galeria', true) ?: []);
-        if ($inv_gallery) {
-            $gallery_ids = array_slice($inv_gallery, 0, 2);
-            update_post_meta($post_id, 'fave_property_images', $gallery_ids);
+        $raw = get_post_meta($parent_id, 'projekt_galeria', true) ?: '';
+        if ($raw) {
+            $all_ids = is_array($raw) ? $raw : explode(',', $raw);
+            $all_ids = array_values(array_filter(array_map('intval', $all_ids)));
+            $gallery_ids = array_slice($all_ids, 0, 2);
+            if ($gallery_ids) {
+                update_post_meta($post_id, 'fave_property_images', $gallery_ids);
+            }
         }
     }
 
