@@ -237,7 +237,7 @@ foreach ($units as $u) {
     $metas = [
         'expro_unit_id'               => $uid,
         'expro_id'                    => (string)$inv['expro_id'],
-        'fave_property_id'            => $uid,
+        'fave_property_id'            => $unit_name ?: $uid,
         'fave_property_price'         => $price,
         'fave_property_price_postfix' => 'PLN',
         'fave_property_size'          => $area,
@@ -349,8 +349,11 @@ foreach ($units as $u) {
         } else {
             $att_id = media_sideload_image($img_url, $post_id, null, 'id');
         }
-        if (!is_wp_error($att_id) && !in_array($att_id, $gallery_ids)) {
-            $gallery_ids[] = $att_id;
+        if (!is_wp_error($att_id)) {
+            update_post_meta($att_id, '_source_url', $img_url);
+            if (!in_array($att_id, $gallery_ids)) {
+                $gallery_ids[] = $att_id;
+            }
         }
     }
 

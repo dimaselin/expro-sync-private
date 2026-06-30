@@ -749,9 +749,15 @@ def main():
 
         browser.close()
 
-    # Save
-    out_path = DATA_FILE
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    # Rotate: current data → prev (used as photo cache on next run)
+    out_path  = Path(DATA_FILE)
+    prev_path = Path("data/expro_prev.json")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.exists():
+        import shutil
+        shutil.copy2(out_path, prev_path)
+        log(f"Rotated previous data → {prev_path}")
+
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 

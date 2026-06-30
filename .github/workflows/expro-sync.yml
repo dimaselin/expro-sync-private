@@ -111,12 +111,27 @@ jobs:
           print('config.py created')
           PYEOF
 
+      - name: Restore data cache (expro_prev.json for unit photo dedup)
+        uses: actions/cache@v4
+        with:
+          path: data/expro_prev.json
+          key: expro-prev-${{ github.run_id }}
+          restore-keys: |
+            expro-prev-
+
       - name: Scrape ExPro data (if needed)
         if: ${{ github.event.inputs.mode != 'all' && github.event.inputs.mode != 'scrape' && github.event.inputs.mode != '' }}
         run: python3 run.py scrape
 
       - name: Run sync
         run: python3 run.py ${{ github.event.inputs.mode || 'all' }}
+
+      - name: Save data cache (expro_prev.json for next run)
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: data/expro_prev.json
+          key: expro-prev-${{ github.run_id }}
 
       - name: Write job summary
         if: always()
