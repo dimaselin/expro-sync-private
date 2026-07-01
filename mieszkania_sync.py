@@ -355,9 +355,12 @@ foreach ($units as $u) {
     }
 
     // ── Floor plan ───────────────────────────────────────────────────────
+    // Plan is always the main card image (_thumbnail_id)
     $plan_url        = $u['plan_urls'][0] ?? '';
     $plan_server_map = $u['plan_server_map'] ?? [];
-    if ($plan_url && !get_post_meta($post_id, 'lokal_plan_attachment_id', true)) {
+    $plan_att        = (int)get_post_meta($post_id, 'lokal_plan_attachment_id', true);
+
+    if (!$plan_att && $plan_url) {
         $existing_plan = get_posts([
             'post_type'      => 'attachment',
             'meta_key'       => '_source_url',
@@ -371,16 +374,23 @@ foreach ($units as $u) {
             $tmp = tempnam(sys_get_temp_dir(), 'esm_plan_');
             copy($plan_server_map[$plan_url], $tmp);
             $file_array = ['name' => basename($plan_server_map[$plan_url]), 'tmp_name' => $tmp];
-            $plan_att = media_handle_sideload($file_array, $post_id);
+            $plan_att_new = media_handle_sideload($file_array, $post_id);
+            if (!is_wp_error($plan_att_new)) { $plan_att = $plan_att_new; }
         } else {
-            $plan_att = media_sideload_image($plan_url, $post_id, null, 'id');
+            $plan_att_new = media_sideload_image($plan_url, $post_id, null, 'id');
+            if (!is_wp_error($plan_att_new)) { $plan_att = $plan_att_new; }
         }
-        if (!is_wp_error($plan_att)) {
-            update_post_meta($plan_att,  '_source_url',              $plan_url);
-            update_post_meta($post_id,   'lokal_plan_attachment_id', (string)$plan_att);
+        if ($plan_att) {
+            update_post_meta($plan_att, '_source_url',              $plan_url);
+            update_post_meta($post_id,  'lokal_plan_attachment_id', (string)$plan_att);
         } else {
             update_post_meta($post_id, 'lokal_plan_url_expro', $plan_url);
         }
+    }
+
+    // Always use plan as thumbnail (overrides investment photo set above)
+    if ($plan_att) {
+        set_post_thumbnail($post_id, $plan_att);
     }
 }
 
