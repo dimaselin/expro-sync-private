@@ -514,12 +514,15 @@ def scrape_detail(page, inv_id: str, known_unit_photos: dict | None = None) -> O
                     unit["_action_links"] = [f"{BASE_URL}/realestate/view/realestate_id/{rid_val}/"]
                     # Log row attrs for diagnosis (first unit only)
                     if i == 0:
-                        all_hrefs   = re.findall(r'href=["\']([^"\']+)["\']', row_html)
-                        all_onclicks = re.findall(r'onclick=["\']([^"\']{0,120})["\']', row_html)
-                        data_attrs  = re.findall(r'data-[a-z\-]+=["\']([^"\']+)["\']', row_html)
-                        log(f"  [diag] unit[0] row hrefs:    {all_hrefs[:8]}")
-                        log(f"  [diag] unit[0] row onclicks: {all_onclicks[:4]}")
-                        log(f"  [diag] unit[0] data-attrs:   {data_attrs[:8]}")
+                        all_hrefs    = re.findall(r'href=["\']([^"\']+)["\']', row_html)
+                        all_onclicks = re.findall(r'onclick=["\']([^"\']{0,300})["\']', row_html)
+                        # data-content may contain HTML with img src — log full value
+                        data_contents = re.findall(r'data-content=["\']([^"\']{0,500})["\']', row_html)
+                        show_gallery  = re.findall(r'showGallery\([^)]{0,300}\)', row_html)
+                        log(f"  [diag] unit[0] row hrefs:      {all_hrefs[:6]}")
+                        log(f"  [diag] unit[0] onclicks:       {all_onclicks[:4]}")
+                        log(f"  [diag] unit[0] data-content:   {data_contents[:3]}")
+                        log(f"  [diag] unit[0] showGallery:    {show_gallery[:3]}")
 
     units_with_links = sum(1 for u in units if u.get("_action_links"))
     log(f"  Phase 1: {units_with_links}/{len(units)} units have action links")
