@@ -498,7 +498,7 @@ def sync_units(ssh: SSHClient, inv: dict, parent_id: int, projekt_term_id: int) 
     ssh.write_remote_file(data_json, '/tmp/esm_units_data.json')
     ssh.write_remote_file(PHP_SYNC_UNITS, '/tmp/esm_sync_units.php')
 
-    out = ssh.run_wp_cli('eval-file /tmp/esm_sync_units.php')
+    out = ssh.run_wp_cli('eval-file /tmp/esm_sync_units.php', timeout=600)
     out = out.strip()
 
     # Cleanup server image temp files

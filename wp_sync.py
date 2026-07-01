@@ -77,6 +77,7 @@ class SSHClient:
             banner_timeout=30,
             auth_timeout=30,
         )
+        client.get_transport().set_keepalive(30)
         self._client = client
         log("SSH connected.")
 
