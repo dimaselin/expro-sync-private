@@ -489,8 +489,9 @@ def scrape_detail(page, inv_id: str, known_unit_photos: dict | None = None) -> O
             "href": doc_href,
         })
 
-    # ── Phase 1: extract realestate_id + action links from each unit row ───────
+    # ── Phase 1: extract realestate_id, action links, and gallery URLs ──────────
     realestate_pat = re.compile(r"/realestate/[^\"']+/realestate_id/(\d+)/")
+    gallery_pat    = re.compile(r"showGallery\(['\"]([^'\"]+)['\"]\)")
     if units_table:
         data_rows = [r for r in units_table.query_selector_all("tr") if r.query_selector_all("td")]
         for i, unit in enumerate(units):
@@ -500,7 +501,16 @@ def scrape_detail(page, inv_id: str, known_unit_photos: dict | None = None) -> O
                 rid_m = realestate_pat.search(row_html)
                 if rid_m:
                     unit["realestate_id"] = rid_m.group(1)
-                # collect all realestate action links (skip offer PDF — it just downloads)
+                # ── Gallery URLs from showGallery() onclick args ──────────────
+                gallery_urls: list[str] = []
+                for m in gallery_pat.finditer(row_html):
+                    path = m.group(1)
+                    full_url = (BASE_URL + path) if path.startswith("/") else path
+                    if full_url not in gallery_urls:
+                        gallery_urls.append(full_url)
+                if gallery_urls:
+                    unit["_gallery_urls"] = gallery_urls
+                # ── Action links for text-attribute parsing (Phase 2) ─────────
                 action_links: list[str] = []
                 for href_m in re.finditer(r'href=["\'](/realestate/[^"\']+)["\']', row_html):
                     href = BASE_URL + href_m.group(1)
@@ -509,23 +519,11 @@ def scrape_detail(page, inv_id: str, known_unit_photos: dict | None = None) -> O
                 if action_links:
                     unit["_action_links"] = action_links
                 elif unit.get("realestate_id"):
-                    # fallback: construct view URL from realestate_id
                     rid_val = unit["realestate_id"]
                     unit["_action_links"] = [f"{BASE_URL}/realestate/view/realestate_id/{rid_val}/"]
-                    # Log row attrs for diagnosis (first unit only)
-                    if i == 0:
-                        all_hrefs    = re.findall(r'href=["\']([^"\']+)["\']', row_html)
-                        all_onclicks = re.findall(r'onclick=["\']([^"\']{0,300})["\']', row_html)
-                        # data-content may contain HTML with img src — log full value
-                        data_contents = re.findall(r'data-content=["\']([^"\']{0,500})["\']', row_html)
-                        show_gallery  = re.findall(r'showGallery\([^)]{0,300}\)', row_html)
-                        log(f"  [diag] unit[0] row hrefs:      {all_hrefs[:6]}")
-                        log(f"  [diag] unit[0] onclicks:       {all_onclicks[:4]}")
-                        log(f"  [diag] unit[0] data-content:   {data_contents[:3]}")
-                        log(f"  [diag] unit[0] showGallery:    {show_gallery[:3]}")
 
-    units_with_links = sum(1 for u in units if u.get("_action_links"))
-    log(f"  Phase 1: {units_with_links}/{len(units)} units have action links")
+    units_with_gallery = sum(1 for u in units if u.get("_gallery_urls"))
+    log(f"  Phase 1: {units_with_gallery}/{len(units)} units have gallery URLs from row HTML")
 
     # ── Phase 2: navigate action links to get per-unit photos + floor plans ───
     if known_unit_photos is None:
@@ -533,130 +531,92 @@ def scrape_detail(page, inv_id: str, known_unit_photos: dict | None = None) -> O
     ctx = page.context
     for unit in units:
         rid = unit.get("realestate_id", "")
-        # Reuse cached data from previous scrape
+        gallery_urls = unit.pop("_gallery_urls", [])
+        action_links = unit.pop("_action_links", [])
+
+        # Reuse cached data — but only if cache actually has photos/plans
         if rid and rid in known_unit_photos:
             cached = known_unit_photos[rid]
             photo_urls = cached.get("photo_urls", [])
             plan_urls  = cached.get("plan_urls",  [])
-            if photo_urls:
-                unit["photo_urls"] = photo_urls
-            if plan_urls:
-                unit["plan_urls"] = plan_urls
-            # Re-download images using fast page.request (no tab) if not on disk
-            img_dir = Path(f"data/images/{rid}")
-            img_dir.mkdir(parents=True, exist_ok=True)
-            pu_map, pl_map = {}, {}
-            for i, url in enumerate(photo_urls):
-                lp = img_dir / f"photo_{i}.jpg"
-                if lp.exists():
-                    pu_map[url] = str(lp)
-                else:
-                    try:
-                        r = page.context.request.get(url)
-                        if r.ok:
-                            lp.write_bytes(r.body())
-                            pu_map[url] = str(lp)
-                    except Exception:
-                        pass
-            for i, url in enumerate(plan_urls):
-                lp = img_dir / f"plan_{i}.jpg"
-                if lp.exists():
-                    pl_map[url] = str(lp)
-                else:
-                    try:
-                        r = page.context.request.get(url)
-                        if r.ok:
-                            lp.write_bytes(r.body())
-                            pl_map[url] = str(lp)
-                    except Exception:
-                        pass
-            if pu_map:
-                unit["photo_url_map"] = pu_map
-            if pl_map:
-                unit["plan_url_map"] = pl_map
-            unit.pop("_action_links", None)
-            continue
+            has_cached_images = bool(photo_urls or plan_urls)
+            if has_cached_images:
+                if photo_urls:
+                    unit["photo_urls"] = photo_urls
+                if plan_urls:
+                    unit["plan_urls"] = plan_urls
+                img_dir = Path(f"data/images/{rid}")
+                img_dir.mkdir(parents=True, exist_ok=True)
+                pu_map, pl_map = {}, {}
+                for i, url in enumerate(photo_urls):
+                    lp = img_dir / f"photo_{i}.jpg"
+                    if lp.exists():
+                        pu_map[url] = str(lp)
+                    else:
+                        try:
+                            r = page.context.request.get(url)
+                            if r.ok:
+                                lp.write_bytes(r.body())
+                                pu_map[url] = str(lp)
+                        except Exception:
+                            pass
+                for i, url in enumerate(plan_urls):
+                    lp = img_dir / f"plan_{i}.jpg"
+                    if lp.exists():
+                        pl_map[url] = str(lp)
+                    else:
+                        try:
+                            r = page.context.request.get(url)
+                            if r.ok:
+                                lp.write_bytes(r.body())
+                                pl_map[url] = str(lp)
+                        except Exception:
+                            pass
+                if pu_map:
+                    unit["photo_url_map"] = pu_map
+                if pl_map:
+                    unit["plan_url_map"] = pl_map
+                continue
+            # cached with 0 images — fall through to re-scrape using gallery_urls
 
-        action_links = unit.pop("_action_links", [])
-        if not action_links:
-            continue
-
-        unit_imgs:      list[str] = []
-        unit_plans:     list[str] = []
-        photo_url_map:  dict[str, str] = {}  # url → local_path (downloaded ok)
-        plan_url_map:   dict[str, str] = {}
+        unit_imgs:    list[str] = []
+        unit_plans:   list[str] = []
+        photo_url_map: dict[str, str] = {}
+        plan_url_map:  dict[str, str] = {}
         img_dir = Path(f"data/images/{rid}")
         img_dir.mkdir(parents=True, exist_ok=True)
+
+        # ── Download images from row showGallery() URLs ───────────────────────
+        # First URL = floor plan (rzut), additional = unit photos
+        for idx, url in enumerate(gallery_urls):
+            is_plan = (idx == 0)
+            target_list = unit_plans if is_plan else unit_imgs
+            url_map     = plan_url_map if is_plan else photo_url_map
+            prefix      = "plan" if is_plan else "photo"
+            local_idx   = len(target_list)
+            local_path  = img_dir / f"{prefix}_{local_idx}.jpg"
+            target_list.append(url)
+            if local_path.exists():
+                url_map[url] = str(local_path)
+            else:
+                try:
+                    resp = page.context.request.get(url)
+                    if resp.ok:
+                        local_path.write_bytes(resp.body())
+                        url_map[url] = str(local_path)
+                    else:
+                        log(f"    WARN: {url} → HTTP {resp.status}")
+                except Exception as dl_err:
+                    log(f"    WARN: download failed {url}: {dl_err}")
+        if gallery_urls:
+            log(f"  [{rid}] gallery: {len(unit_plans)} plan(s), {len(unit_imgs)} photo(s)")
+
+        # ── Navigate action pages for text attributes only ────────────────────
         for link_url in action_links:
             tab = None
             try:
                 tab = ctx.new_page()
                 tab.goto(link_url, wait_until="domcontentloaded", timeout=20_000)
-                log(f"    [{rid}] action page: {link_url}")
-
-                # Collect candidate URLs: img[src] + a[href] pointing to /files/
-                candidate_urls: list[str] = []
-                for img_el in tab.query_selector_all("img"):
-                    src = (img_el.get_attribute("src") or "").strip()
-                    if src:
-                        candidate_urls.append(src)
-                for a_el in tab.query_selector_all("a[href]"):
-                    href = (a_el.get_attribute("href") or "").strip()
-                    # include links to image files and PDFs that may be floor plans
-                    if href and any(href.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".pdf"]):
-                        candidate_urls.append(href)
-
-                found_on_page = 0
-                for src in candidate_urls:
-                    if src.startswith("//"):
-                        src = "https:" + src
-                    elif src.startswith("/"):
-                        src = BASE_URL + src
-                    if "/files/" not in src.lower():
-                        continue
-                    is_plan = any(k in src.lower() for k in ["plan", "rzut"])
-                    target_list = unit_plans if is_plan else unit_imgs
-                    url_map    = plan_url_map if is_plan else photo_url_map
-                    prefix     = "plan" if is_plan else "photo"
-                    if src in target_list:
-                        continue
-                    target_list.append(src)
-                    found_on_page += 1
-                    idx = len(target_list) - 1
-                    local_path = img_dir / f"{prefix}_{idx}.jpg"
-                    # Download using authenticated Playwright session
-                    if local_path.exists():
-                        url_map[src] = str(local_path)
-                    else:
-                        try:
-                            resp = tab.context.request.get(src)
-                            if resp.ok:
-                                local_path.write_bytes(resp.body())
-                                url_map[src] = str(local_path)
-                            else:
-                                log(f"    WARN: {src} → HTTP {resp.status}")
-                        except Exception as dl_err:
-                            log(f"    WARN: download failed {src}: {dl_err}")
-                if found_on_page == 0:
-                    all_hrefs_on_page = [
-                        el.get_attribute("href") or ""
-                        for el in tab.query_selector_all("a[href]")
-                    ]
-                    files_srcs = [s for s in all_hrefs_on_page if "/files/" in s.lower()]
-                    img_srcs = [
-                        el.get_attribute("src") or ""
-                        for el in tab.query_selector_all("img")
-                    ]
-                    img_files = [s for s in img_srcs if "/files/" in s.lower()]
-                    all_files = files_srcs + img_files
-                    if all_files:
-                        log(f"    [{rid}] /files/ found but none matched filter: {all_files[:3]}")
-                    else:
-                        log(f"    [{rid}] no /files/ URLs on page (imgs={len(img_srcs)})")
-                        # Show page links to understand structure (first unit only)
-                        if link_url == action_links[0] and rid == units[0].get("realestate_id", ""):
-                            interesting = [h for h in all_hrefs_on_page if h and not h.startswith("#")][:10]
-                            log(f"    [diag] page links: {interesting}")
 
                 # Parse page text for unit-level attributes
                 try:
