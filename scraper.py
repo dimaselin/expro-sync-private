@@ -512,10 +512,14 @@ def scrape_detail(page, inv_id: str, known_unit_photos: dict | None = None) -> O
                     # fallback: construct view URL from realestate_id
                     rid_val = unit["realestate_id"]
                     unit["_action_links"] = [f"{BASE_URL}/realestate/view/realestate_id/{rid_val}/"]
-                    # Log what hrefs are actually in the row so we can pick the right one
-                    all_hrefs = re.findall(r'href=["\']([^"\']+)["\']', row_html)
+                    # Log row attrs for diagnosis (first unit only)
                     if i == 0:
-                        log(f"  [diag] unit[0] row hrefs: {all_hrefs[:8]}")
+                        all_hrefs   = re.findall(r'href=["\']([^"\']+)["\']', row_html)
+                        all_onclicks = re.findall(r'onclick=["\']([^"\']{0,120})["\']', row_html)
+                        data_attrs  = re.findall(r'data-[a-z\-]+=["\']([^"\']+)["\']', row_html)
+                        log(f"  [diag] unit[0] row hrefs:    {all_hrefs[:8]}")
+                        log(f"  [diag] unit[0] row onclicks: {all_onclicks[:4]}")
+                        log(f"  [diag] unit[0] data-attrs:   {data_attrs[:8]}")
 
     units_with_links = sum(1 for u in units if u.get("_action_links"))
     log(f"  Phase 1: {units_with_links}/{len(units)} units have action links")
