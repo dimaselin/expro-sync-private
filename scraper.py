@@ -510,8 +510,12 @@ def scrape_detail(page, inv_id: str, known_unit_photos: dict | None = None) -> O
                     unit["_action_links"] = action_links
                 elif unit.get("realestate_id"):
                     # fallback: construct view URL from realestate_id
-                    rid = unit["realestate_id"]
-                    unit["_action_links"] = [f"{BASE_URL}/realestate/view/realestate_id/{rid}/"]
+                    rid_val = unit["realestate_id"]
+                    unit["_action_links"] = [f"{BASE_URL}/realestate/view/realestate_id/{rid_val}/"]
+                    # Log what hrefs are actually in the row so we can pick the right one
+                    all_hrefs = re.findall(r'href=["\']([^"\']+)["\']', row_html)
+                    if i == 0:
+                        log(f"  [diag] unit[0] row hrefs: {all_hrefs[:8]}")
 
     units_with_links = sum(1 for u in units if u.get("_action_links"))
     log(f"  Phase 1: {units_with_links}/{len(units)} units have action links")
@@ -627,16 +631,25 @@ def scrape_detail(page, inv_id: str, known_unit_photos: dict | None = None) -> O
                         except Exception as dl_err:
                             log(f"    WARN: download failed {src}: {dl_err}")
                 if found_on_page == 0:
-                    # Log all /files/ URLs for diagnosis when nothing found
-                    all_srcs = [
-                        (el.get_attribute("src") or el.get_attribute("href") or "")
-                        for el in tab.query_selector_all("img, a[href]")
+                    all_hrefs_on_page = [
+                        el.get_attribute("href") or ""
+                        for el in tab.query_selector_all("a[href]")
                     ]
-                    files_srcs = [s for s in all_srcs if "/files/" in s.lower()]
-                    if files_srcs:
-                        log(f"    [{rid}] /files/ found but none matched filter: {files_srcs[:3]}")
+                    files_srcs = [s for s in all_hrefs_on_page if "/files/" in s.lower()]
+                    img_srcs = [
+                        el.get_attribute("src") or ""
+                        for el in tab.query_selector_all("img")
+                    ]
+                    img_files = [s for s in img_srcs if "/files/" in s.lower()]
+                    all_files = files_srcs + img_files
+                    if all_files:
+                        log(f"    [{rid}] /files/ found but none matched filter: {all_files[:3]}")
                     else:
-                        log(f"    [{rid}] no /files/ URLs on page (imgs={len(tab.query_selector_all('img'))})")
+                        log(f"    [{rid}] no /files/ URLs on page (imgs={len(img_srcs)})")
+                        # Show page links to understand structure (first unit only)
+                        if link_url == action_links[0] and rid == units[0].get("realestate_id", ""):
+                            interesting = [h for h in all_hrefs_on_page if h and not h.startswith("#")][:10]
+                            log(f"    [diag] page links: {interesting}")
 
                 # Parse page text for unit-level attributes
                 try:
