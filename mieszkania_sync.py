@@ -7,13 +7,29 @@ Usage:
   python3 mieszkania_sync.py --all
   python3 mieszkania_sync.py --expro-ids 7567,7563
 """
-import argparse, json, re, sys
+import argparse, json, re, sys, time, traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from wp_sync import SSHClient, log
 
-DATA = Path(__file__).parent / 'data' / 'expro_data.json'
+DATA      = Path(__file__).parent / 'data' / 'expro_data.json'
+PROGRESS  = Path(__file__).parent / 'data' / 'mieszkania_sync_progress.json'
+LOG_FILE  = Path(__file__).parent / 'data' / 'mieszkania_sync.log'
+
+# ExPro IDs that are ONLY Dom — never overwrite their projekt_typ
+_DOM_ONLY_IDS = None  # type: ignore
+
+def _dom_only_ids() -> set:
+    global _DOM_ONLY_IDS
+    if _DOM_ONLY_IDS is None:
+        data = json.loads(DATA.read_text('utf-8'))
+        _DOM_ONLY_IDS = {
+            str(d['expro_id']) for d in data
+            if all(u.get('type', '') in ('Dom', 'Segment', '') for u in d.get('units', []))
+            and any(u.get('type', '') == 'Dom' for u in d.get('units', []))
+        }
+    return _DOM_ONLY_IDS
 
 # ── Taxonomy term IDs (verified on site) ─────────────────────────────────────
 LABEL_RYNEK_PIERWOTNY = 181   # property_label: Rynek Pierwotny
@@ -286,7 +302,7 @@ foreach ($units as $u) {
 
     // ── Taxonomies ───────────────────────────────────────────────────────
     wp_set_object_terms($post_id, [$label_tid], 'property_label');
-    wp_set_object_terms($post_id, [$status_slug], 'property_status');
+    wp_set_object_terms($post_id, [$status_slug, 'sprzedaz'], 'property_status');
     wp_set_object_terms($post_id, [$type_slug],   'property_type');
     if ($projekt_tid) {
         wp_set_object_terms($post_id, [$projekt_tid], 'projekt');
@@ -388,7 +404,7 @@ foreach ($units as $u) {
         }
     }
 
-    // Always use plan as thumbnail (overrides investment photo set above)
+    // Use floor plan as card thumbnail if available
     if ($plan_att) {
         set_post_thumbnail($post_id, $plan_att);
     }
@@ -526,70 +542,185 @@ def sync_units(ssh: SSHClient, inv: dict, parent_id: int, projekt_term_id: int) 
         return 0, 0
 
 
+# ── Progress helpers ──────────────────────────────────────────────────────────
+
+def _load_progress() -> dict:
+    if PROGRESS.exists():
+        try:
+            return json.loads(PROGRESS.read_text('utf-8'))
+        except Exception:
+            pass
+    return {'done': [], 'failed': []}
+
+def _save_progress(p: dict) -> None:
+    PROGRESS.write_text(json.dumps(p, ensure_ascii=False, indent=2), 'utf-8')
+
+def _log(msg: str) -> None:
+    log(msg)
+    try:
+        with LOG_FILE.open('a', encoding='utf-8') as f:
+            f.write(msg + '\n')
+    except Exception:
+        pass
+
+# ── SSH reconnect wrapper ─────────────────────────────────────────────────────
+
+def _ensure_ssh(ssh: SSHClient) -> SSHClient:
+    """Reconnect if SSH dropped."""
+    try:
+        ssh._client.get_transport().is_active()  # type: ignore
+        return ssh
+    except Exception:
+        _log('  SSH lost — reconnecting...')
+        try:
+            ssh.close()
+        except Exception:
+            pass
+        new = SSHClient()
+        new._connect()
+        return new
+
+# ── Single investment with full error guard ───────────────────────────────────
+
+def sync_one(ssh: SSHClient, inv: dict, post_map: dict) -> tuple[SSHClient, str]:
+    """
+    Returns (ssh, status) where status is 'ok' | 'skip' | 'error'.
+    Re-raises nothing — all exceptions are caught here.
+    """
+    expro_id = str(inv.get('expro_id') or inv.get('id', ''))
+    name     = inv.get('name', expro_id)
+    units    = inv.get('units', [])
+
+    _log(f'\n{"="*60}')
+    _log(f'[{expro_id}] {name} — {len(units)} units')
+
+    # Guard: never touch pure-Dom investments
+    if expro_id in _dom_only_ids():
+        _log(f'  SKIP: Dom-only investment — not touching')
+        return ssh, 'skip'
+
+    parent_id = post_map.get(expro_id)
+    if not parent_id:
+        _log(f'  SKIP: no inwestycja post in WP for expro_id={expro_id}')
+        return ssh, 'skip'
+
+    _log(f'  Parent post: {parent_id}')
+
+    try:
+        ssh = _ensure_ssh(ssh)
+        projekt_term_id = get_projekt_term_id(ssh, parent_id)
+        if projekt_term_id:
+            _log(f'  Projekt term ID: {projekt_term_id}')
+        else:
+            _log(f'  WARNING: no projekt term for post {parent_id}')
+
+        ssh = _ensure_ssh(ssh)
+        c, u = sync_units(ssh, inv, parent_id, projekt_term_id)
+        _log(f'  ✓ {c} created, {u} updated')
+        return ssh, 'ok'
+
+    except Exception as e:
+        _log(f'  ERROR: {e}')
+        _log(f'  {traceback.format_exc().splitlines()[-1]}')
+        return ssh, 'error'
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--expro-ids', help='Comma-separated ExPro IDs to sync')
-    parser.add_argument('--all', action='store_true', help='Sync all investments with units')
+    parser.add_argument('--all',    action='store_true', help='Sync all investments with units')
+    parser.add_argument('--resume', action='store_true', help='Skip already-done investments')
+    parser.add_argument('--retry',  action='store_true', help='Retry only previously failed ones')
+    parser.add_argument('--reset-progress', action='store_true', help='Clear progress file')
     args = parser.parse_args()
 
     if not DATA.exists():
-        log(f'ERROR: {DATA} not found — run scrape first')
+        _log(f'ERROR: {DATA} not found — run scrape first')
         sys.exit(1)
 
+    if args.reset_progress:
+        PROGRESS.unlink(missing_ok=True)
+        _log('Progress cleared.')
+        return
+
     all_data = json.loads(DATA.read_text('utf-8'))
+    progress = _load_progress()
 
     if args.expro_ids:
         ids = set(args.expro_ids.split(','))
         investments = [d for d in all_data if str(d.get('expro_id') or d.get('id', '')) in ids]
     elif args.all:
         investments = [d for d in all_data if d.get('units')]
+    elif args.retry:
+        failed_ids = set(progress.get('failed', []))
+        investments = [d for d in all_data if str(d.get('expro_id') or d.get('id', '')) in failed_ids]
+        _log(f'Retrying {len(investments)} previously failed investments')
     else:
         parser.print_help()
         return
 
-    log(f'Investments with units to sync: {len(investments)}')
+    # Filter already done if --resume
+    if args.resume or args.all:
+        done_ids = set(progress.get('done', []))
+        before = len(investments)
+        investments = [d for d in investments
+                       if str(d.get('expro_id') or d.get('id', '')) not in done_ids]
+        if before != len(investments):
+            _log(f'Resume: skipping {before - len(investments)} already done, {len(investments)} remaining')
+
+    _log(f'Investments to sync: {len(investments)}')
 
     ssh = SSHClient()
     ssh._connect()
-    log('SSH connected.')
+    _log('SSH connected.')
 
-    # Build expro_id → WP post_id map
-    post_map = get_post_map(ssh)
-    log(f'Found {len(post_map)} inwestycja posts in WP.')
+    # Build expro_id → WP post_id map (with retry)
+    for attempt in range(3):
+        try:
+            post_map = get_post_map(ssh)
+            _log(f'Found {len(post_map)} inwestycja posts in WP.')
+            break
+        except Exception as e:
+            _log(f'get_post_map failed (attempt {attempt+1}): {e}')
+            time.sleep(5)
+            ssh = _ensure_ssh(ssh)
+    else:
+        _log('FATAL: cannot load post map after 3 attempts')
+        sys.exit(1)
 
-    total_created = total_updated = total_skipped = 0
+    total_ok = total_skip = total_err = 0
 
-    for inv in investments:
+    for i, inv in enumerate(investments, 1):
         expro_id = str(inv.get('expro_id') or inv.get('id', ''))
-        name     = inv.get('name', expro_id)
-        units    = inv.get('units', [])
+        _log(f'[{i}/{len(investments)}]')
 
-        log(f'\n{"="*60}')
-        log(f'[{expro_id}] {name} — {len(units)} units')
+        ssh, status = sync_one(ssh, inv, post_map)
 
-        parent_id = post_map.get(expro_id)
-        if not parent_id:
-            log(f'  SKIP: no inwestycja post found for expro_id={expro_id}')
-            total_skipped += 1
-            continue
-
-        log(f'  Parent post: {parent_id}')
-
-        projekt_term_id = get_projekt_term_id(ssh, parent_id)
-        if projekt_term_id:
-            log(f'  Projekt term ID: {projekt_term_id}')
+        if status == 'ok':
+            total_ok += 1
+            progress['done'] = list(set(progress.get('done', [])) | {expro_id})
+            # Remove from failed if it was there
+            progress['failed'] = [x for x in progress.get('failed', []) if x != expro_id]
+        elif status == 'skip':
+            total_skip += 1
         else:
-            log(f'  WARNING: no projekt term for post {parent_id}')
+            total_err += 1
+            progress['failed'] = list(set(progress.get('failed', [])) | {expro_id})
 
-        c, u = sync_units(ssh, inv, parent_id, projekt_term_id)
-        log(f'  ✓ {c} created, {u} updated')
-        total_created += c
-        total_updated += u
+        _save_progress(progress)
+        time.sleep(0.5)  # small pause to avoid hammering server
 
-    ssh.close()
-    log(f'\nMieszkania sync complete: {total_created} created, {total_updated} updated, {total_skipped} skipped.')
+    try:
+        ssh.close()
+    except Exception:
+        pass
+
+    _log(f'\n{"="*60}')
+    _log(f'Done: {total_ok} ok, {total_skip} skipped, {total_err} errors')
+    if progress.get('failed'):
+        _log(f'Failed IDs: {", ".join(progress["failed"])}')
+        _log('Re-run with --retry to retry failed ones')
 
 
 if __name__ == '__main__':

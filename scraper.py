@@ -171,7 +171,7 @@ def collect_investment_ids(page) -> list[str]:
 # Scrape single investment detail page
 # ---------------------------------------------------------------------------
 
-def scrape_detail(page, inv_id: str, known_unit_photos: dict | None = None) -> Optional[dict]:
+def scrape_detail(page, inv_id: str, known_unit_photos: Optional[dict] = None) -> Optional[dict]:
     url = f"{BASE_URL}/investments/viewdetails/id/{inv_id}/"
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=45_000)

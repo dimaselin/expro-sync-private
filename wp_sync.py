@@ -356,6 +356,15 @@ _TYP_PATTERNS = [
     (["dom"],                                            "dom"),
 ]
 
+# ExPro sends "Mieszkanie" as unit type even for villas/row-houses/commercial.
+# These overrides prevent sync from reverting manually-corrected projekt_typ.
+_PROJEKT_TYP_OVERRIDES: dict[str, str] = {
+    "7557": "dom",      # Wille Biskupin etap II
+    "7293": "dom",      # Wille Biskupin etap I
+    "6703": "dom",      # Nowa Winnica etap I - szeregi 9-12
+    "6001": "usluga",   # Przystań Królewiecka III - lokale usługowe
+}
+
 def detect_projekt_typ(inv: dict) -> str:
     """Detect projekt_typ from unit types in ExPro data."""
     units = inv.get("units", [])
@@ -525,7 +534,7 @@ def sync_investment(ssh: SSHClient, inv: dict) -> Tuple[str, Optional[int]]:
         m_del = re.match(r"od\s+(.+?)\s+do\s+\1$", delivery_raw.strip())
         delivery = m_del.group(1) if m_del else re.sub(r"^od\s+", "", delivery_raw)
 
-        projekt_typ = detect_projekt_typ(inv)
+        projekt_typ = _PROJEKT_TYP_OVERRIDES.get(str(expro_id)) or detect_projekt_typ(inv)
 
         meta_fields: list[tuple[str, str]] = [
             ("expro_id",              expro_id),

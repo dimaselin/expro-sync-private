@@ -79,6 +79,30 @@ except ImportError:
 EXPRO_DATA_FILE = Path(__file__).parent / 'data' / 'expro_data.json'
 DOWNLOAD_DIR    = Path(__file__).parent / 'data' / 'pdfs'
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+PROGRESS_FILE   = Path(__file__).parent / 'data' / 'pipeline_progress.json'
+LOG_FILE        = Path(__file__).parent / 'data' / 'pipeline.log'
+
+
+def _load_progress() -> dict:
+    if PROGRESS_FILE.exists():
+        try:
+            return json.loads(PROGRESS_FILE.read_text('utf-8'))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_progress(p: dict):
+    PROGRESS_FILE.write_text(json.dumps(p, indent=2, ensure_ascii=False), 'utf-8')
+
+
+def _log(msg: str):
+    log(msg)
+    try:
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(f'[{datetime.now().strftime("%H:%M:%S")}] {msg}\n')
+    except Exception:
+        pass
 
 HTTP_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
@@ -216,7 +240,11 @@ def download_pdf(url: str, post_id: int) -> str:
         log(f'  PDF cached: {dest.name}')
         return str(dest)
     try:
-        req  = urllib.request.Request(url, headers=HTTP_HEADERS)
+        # Percent-encode non-ASCII characters in path (e.g. Polish letters in URL)
+        parsed = urllib.parse.urlparse(url)
+        encoded_path = urllib.parse.quote(parsed.path, safe='/:@!$&\'()*+,;=-._~%')
+        safe_url = parsed._replace(path=encoded_path).geturl()
+        req  = urllib.request.Request(safe_url, headers=HTTP_HEADERS)
         resp = urllib.request.urlopen(req, timeout=20)
         data = resp.read()
         dest.write_bytes(data)
@@ -571,61 +599,124 @@ def enrich(post_id: int, expro_id: str, api_key: str = '', steps: list = None,
 def main():
     parser = argparse.ArgumentParser(description='Realsy investment enrichment pipeline')
     group  = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--all',     action='store_true', help='Enrich all posts missing projekt_standard')
-    group.add_argument('--post-id', type=int,            help='Single WP post ID')
+    group.add_argument('--all',      action='store_true', help='Enrich all posts missing projekt_standard')
+    group.add_argument('--post-id',  type=int,            help='Single WP post ID')
+    group.add_argument('--post-ids', type=str,            help='Comma-separated WP post IDs')
     parser.add_argument('--steps',   default='contacts,website,pdf,expro_pdf,claude,save')
     parser.add_argument('--api-key', default=_DEFAULT_API_KEY,
                         help='Anthropic API key (or set in config.py)')
     parser.add_argument('--force',   action='store_true',
                         help='Re-enrich even if data already exists')
+    parser.add_argument('--resume',  action='store_true',
+                        help='Skip posts already marked ok in progress file')
+    parser.add_argument('--retry',   action='store_true',
+                        help='Only retry posts marked error in progress file')
+    parser.add_argument('--reset-progress', action='store_true',
+                        help='Delete progress file and start fresh')
+    parser.add_argument('--typ',       default='',
+                        help='Filter by projekt_typ: dom | mieszkanie')
+    parser.add_argument('--check-key', default='projekt_standard',
+                        help='Meta key to check for "needs enrichment" (default: projekt_standard)')
     args   = parser.parse_args()
     steps  = [s.strip() for s in args.steps.split(',')]
 
+    if args.reset_progress and PROGRESS_FILE.exists():
+        PROGRESS_FILE.unlink()
+        _log('Progress file deleted.')
+
     if not args.api_key and 'claude' in steps:
-        log('WARNING: no ANTHROPIC_API_KEY — Claude step will be skipped')
-        log('Set it in config.py: ANTHROPIC_API_KEY = "sk-ant-..."')
+        _log('WARNING: no ANTHROPIC_API_KEY — Claude step will be skipped')
 
     ssh = SSHClient()
     ssh._connect()
 
     if args.all:
         pairs = get_all_posts_expro(ssh)
-        log(f'Total posts: {len(pairs)}')
-        test_inv = os.environ.get("EXPRO_TEST_INV_ID", "").strip()
+        _log(f'Total posts: {len(pairs)}')
+
+        # Filter by typ if requested
+        if args.typ:
+            filtered = []
+            for pid, eid in pairs:
+                try:
+                    t = ssh.run_wp_cli(f'post meta get {pid} projekt_typ').strip()
+                except Exception:
+                    t = ''
+                if t == args.typ:
+                    filtered.append((pid, eid))
+            pairs = filtered
+            _log(f'After --typ={args.typ} filter: {len(pairs)}')
+
+        test_inv = os.environ.get('EXPRO_TEST_INV_ID', '').strip()
         if test_inv:
-            test_ids = set(test_inv.split(","))
+            test_ids = set(test_inv.split(','))
             pairs = [(pid, eid) for pid, eid in pairs if eid in test_ids]
-            log(f'TEST MODE: filtered to {len(pairs)} investment(s): {test_inv}')
+            _log(f'TEST MODE: {len(pairs)} investment(s)')
+
         if not args.force:
-            # Filter to only posts that need enrichment
+            check_key = args.check_key
             needs = []
             for pid, eid in pairs:
                 try:
-                    standard = ssh.run_wp_cli(f'post meta get {pid} projekt_standard').strip()
+                    val = ssh.run_wp_cli(f'post meta get {pid} {check_key}').strip()
                 except Exception:
-                    standard = ''
-                if not standard:
+                    val = ''
+                if not val:
                     needs.append((pid, eid))
-            log(f'Needing enrichment: {len(needs)}')
+            _log(f'Needing enrichment (missing {check_key}): {len(needs)}')
             pairs = needs
+    elif args.post_ids:
+        pairs = []
+        for pid_str in args.post_ids.split(','):
+            pid = int(pid_str.strip())
+            try:
+                eid = ssh.run_wp_cli(f'post meta get {pid} expro_id').strip()
+            except Exception:
+                eid = ''
+            if eid:
+                pairs.append((pid, eid))
+            else:
+                _log(f'SKIP: post {pid} has no expro_id')
+        _log(f'--post-ids: {len(pairs)} posts with expro_id')
     else:
-        expro_id = ssh.run_wp_cli(f'post meta get {args.post_id} expro_id').strip()
+        try:
+            expro_id = ssh.run_wp_cli(f'post meta get {args.post_id} expro_id').strip()
+        except Exception:
+            expro_id = ''
         if not expro_id:
-            log(f'ERROR: post {args.post_id} has no expro_id meta')
+            _log(f'ERROR: post {args.post_id} has no expro_id meta')
             sys.exit(1)
         pairs = [(args.post_id, expro_id)]
 
     ssh.close()
 
-    ok = 0
+    # Apply resume/retry filters
+    progress = _load_progress()
+    if args.retry:
+        pairs = [(pid, eid) for pid, eid in pairs if progress.get(str(pid)) == 'error']
+        _log(f'--retry: {len(pairs)} errored posts')
+    elif args.resume:
+        pairs = [(pid, eid) for pid, eid in pairs if progress.get(str(pid)) != 'ok']
+        _log(f'--resume: {len(pairs)} remaining (skipping already ok)')
+
+    ok = err = 0
+    total = len(pairs)
     for i, (post_id, expro_id) in enumerate(pairs, 1):
-        log(f'\n[{i}/{len(pairs)}]')
-        if enrich(post_id, expro_id, api_key=args.api_key, steps=steps, force=args.force):
+        _log(f'\n[{i}/{total}] post={post_id} expro={expro_id}')
+        success = enrich(post_id, expro_id, api_key=args.api_key, steps=steps, force=args.force)
+        if success:
             ok += 1
-        if len(pairs) > 1:
+            progress[str(post_id)] = 'ok'
+        else:
+            err += 1
+            progress[str(post_id)] = 'error'
+        _save_progress(progress)
+        if total > 1:
             time.sleep(2)
 
-    log(f'\nDone: {ok}/{len(pairs)} enriched')
+    _log(f'\nDone: {ok}/{total} ok, {err} errors')
+    if err:
+        _log(f'Re-run with --resume --retry to retry failed posts')
 
 
 if __name__ == '__main__':

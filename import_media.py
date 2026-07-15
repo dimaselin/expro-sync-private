@@ -19,9 +19,22 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from wp_sync import SSHClient, update_meta, import_image_to_wp, log, get_all_posts_expro
 
-DATA  = Path(__file__).parent / 'data' / 'expro_data.json'
-PDFS  = Path(__file__).parent / 'data' / 'pdfs'
+DATA          = Path(__file__).parent / 'data' / 'expro_data.json'
+PDFS          = Path(__file__).parent / 'data' / 'pdfs'
+MEDIA_PROGRESS = Path(__file__).parent / 'data' / 'media_progress.json'
 PDFS.mkdir(exist_ok=True)
+
+
+def _load_media_progress() -> dict:
+    if MEDIA_PROGRESS.exists():
+        try:
+            return json.loads(MEDIA_PROGRESS.read_text())
+        except Exception:
+            pass
+    return {}
+
+def _save_media_progress(p: dict):
+    MEDIA_PROGRESS.write_text(json.dumps(p, indent=2))
 
 
 # ── PDF → JPEG conversion ─────────────────────────────────────────────────────
@@ -186,10 +199,19 @@ def import_media_for(ssh: SSHClient, post_id: int, inv: dict, skip_existing: boo
 def main():
     parser = argparse.ArgumentParser(description='Import ExPro media to WordPress')
     group  = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--all',     action='store_true', help='Process all inwestycja posts')
-    group.add_argument('--post-id', type=int,            help='Single WP post ID')
-    parser.add_argument('--force',  action='store_true', help='Re-import even if already set')
+    group.add_argument('--all',            action='store_true', help='Process all inwestycja posts')
+    group.add_argument('--post-id',        type=int,            help='Single WP post ID')
+    parser.add_argument('--force',         action='store_true', help='Re-import even if already set')
+    parser.add_argument('--resume',        action='store_true', help='Skip posts already marked ok in progress file')
+    parser.add_argument('--retry',         action='store_true', help='Resume + retry error posts')
+    parser.add_argument('--reset-progress',action='store_true', help='Clear progress file and start fresh')
     args = parser.parse_args()
+
+    if args.reset_progress:
+        MEDIA_PROGRESS.unlink(missing_ok=True)
+        log('Progress file cleared.')
+
+    progress = _load_media_progress()
 
     with open(DATA, encoding='utf-8') as f:
         expro_index = {str(d['expro_id']): d for d in json.load(f)}
@@ -206,7 +228,6 @@ def main():
             pairs = [(pid, eid) for pid, eid in pairs if eid in test_ids]
             log(f'TEST MODE: filtered to {len(pairs)} investment(s): {test_inv}')
     else:
-        # Single post: look up expro_id from WP
         raw = ssh.run_wp_cli(f'post meta get {args.post_id} expro_id').strip()
         if not raw:
             log(f'ERROR: post {args.post_id} has no expro_id meta')
@@ -217,13 +238,30 @@ def main():
     total_gallery = total_rzuty = 0
 
     for post_id, expro_id in pairs:
+        key = str(post_id)
+        status = progress.get(key)
+        if args.resume and status == 'ok':
+            log(f'[{post_id}] SKIP (already ok)')
+            continue
+        if (args.resume or args.retry) and status == 'error' and not args.retry:
+            log(f'[{post_id}] SKIP (error — use --retry to reprocess)')
+            continue
+
         inv = expro_index.get(expro_id)
         if not inv:
             log(f'  SKIP post {post_id} — expro_id {expro_id} not in expro_data.json')
+            progress[key] = 'skip'
+            _save_media_progress(progress)
             continue
-        s = import_media_for(ssh, post_id, inv, skip_existing=skip)
-        total_gallery += s['gallery']
-        total_rzuty   += s['rzuty']
+        try:
+            s = import_media_for(ssh, post_id, inv, skip_existing=skip)
+            total_gallery += s['gallery']
+            total_rzuty   += s['rzuty']
+            progress[key] = 'ok'
+        except Exception as e:
+            log(f'  ERROR post {post_id}: {e}')
+            progress[key] = 'error'
+        _save_media_progress(progress)
 
     ssh.run_wp_cli('litespeed-purge all')
     ssh.close()
