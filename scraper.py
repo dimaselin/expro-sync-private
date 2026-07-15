@@ -97,29 +97,42 @@ def scrape_hash(inv: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Login
+# Login + session guard
 # ---------------------------------------------------------------------------
 
 def login(page):
     log(f"Logging in as {USERNAME} …")
     page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
 
-    # fill username
     username_sel = 'input[name="username"], input[name="login"], input[type="text"]'
     page.wait_for_selector(username_sel, timeout=10_000)
     page.fill(username_sel, USERNAME)
-
-    # fill password
     page.fill('input[type="password"]', PASSWORD)
-
-    # submit
     page.click('button[type="submit"], input[type="submit"]')
     page.wait_for_load_state("domcontentloaded", timeout=15_000)
 
-    # verify login success
     if "login" in page.url.lower() and "logout" not in page.content().lower():
         raise RuntimeError(f"Login failed — still on login page: {page.url}")
     log("Login successful.")
+
+
+def is_login_page(page) -> bool:
+    """Return True if the page is the ExPro login screen (session expired)."""
+    try:
+        url = page.url.lower()
+        if "login" in url or "user/login" in url:
+            return True
+        title = page.title().lower()
+        return "login" in title or "logowanie" in title
+    except Exception:
+        return False
+
+
+def ensure_logged_in(page):
+    """Re-authenticate if the current page is the login screen."""
+    if is_login_page(page):
+        log("Session expired — re-authenticating …")
+        login(page)
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +152,15 @@ def collect_investment_ids(page) -> list[str]:
         except PWTimeout:
             log(f"  Timeout on listing page {page_num}, stopping.")
             break
+
+        if is_login_page(page):
+            log(f"  Session expired on listing page {page_num} — re-authenticating …")
+            login(page)
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            except PWTimeout:
+                log(f"  Timeout after re-login on listing page {page_num}, stopping.")
+                break
 
         # find links to investment detail pages
         links = page.query_selector_all('a[href*="/investments/viewdetails/id/"]')
@@ -178,6 +200,16 @@ def scrape_detail(page, inv_id: str, known_unit_photos: Optional[dict] = None) -
     except PWTimeout:
         log(f"  Timeout loading {url}")
         return None
+
+    # Guard: re-login if session expired, then reload the target page
+    if is_login_page(page):
+        log(f"  Session expired before ID={inv_id} — re-authenticating …")
+        login(page)
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+        except PWTimeout:
+            log(f"  Timeout after re-login for {url}")
+            return None
 
     try:
         text = page.inner_text("body")
@@ -738,6 +770,12 @@ def scrape_detail(page, inv_id: str, known_unit_photos: Optional[dict] = None) -
         "scrape_hash": "",  # filled below
     }
     inv["scrape_hash"] = scrape_hash(inv)
+
+    # Sanity check: reject pages that look like a login/error page
+    if not name or "login" in name.lower() or "logowanie" in name.lower():
+        log(f"  WARN: ID={inv_id} has suspicious name '{name}' — skipping (possible session issue)")
+        return None
+
     return inv
 
 
