@@ -133,10 +133,10 @@ def run_mode(mode: str) -> bool:
     pipeline_args = ['--all']
 
     if mode in ('all', 'scrape'):
-        log('=== Starting ExPro scrape ===')
-        if not _run_script('scraper.py'):
+        log('=== Starting ExPro scrape (API) ===')
+        if not _run_script('api_scraper.py'):
             log('=== Scrape FAILED ===')
-            wp_finish(False, {}, error='scraper.py exited with error')
+            wp_finish(False, {}, error='api_scraper.py exited with error')
             return False
         log('=== Scrape complete ===')
 

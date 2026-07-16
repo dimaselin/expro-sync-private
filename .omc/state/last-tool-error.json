@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"until [ \\\"$(grep -c 'Done:' /private/tmp/mieszkania_sync_all.log 2>/dev/null)\\\" -ge 30 ]; do sleep 10; done && echo \\\"Completed: $(grep -c 'Done:' /private/tmp/mieszkania_sync_all.log)\\\" &...",
-  "error": "Exit code 143\nCommand timed out after 10m 0s",
-  "timestamp": "2026-06-26T17:28:34.155Z",
-  "retry_count": 1
-}
