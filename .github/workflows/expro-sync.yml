@@ -30,7 +30,7 @@ concurrency:
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 360      # 6 год — вистачить навіть на перший повний scrape
 
     steps:
