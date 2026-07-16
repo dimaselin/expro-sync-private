@@ -47,6 +47,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Install Playwright + Chromium
+        if: ${{ github.event.inputs.mode == 'amenity' }}
         run: |
           playwright install chromium
           playwright install-deps chromium

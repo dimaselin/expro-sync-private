@@ -1,12 +1,13 @@
 name: Amenity Patch (Phase 2)
 
 # Scrapes balcony/terrace/garden/garage/basement for ExPro units.
-# Only new units (not in cache) are scraped — first run is slow, subsequent runs are fast.
-# Runs weekly after main ExPro sync, fully automatic.
+# Only new units (not yet in cache) are scraped each run.
+# expro_data.json comes from yesterday's daily sync via GitHub Actions cache.
+# amenity_data.json is a persistent cache that grows over time.
 
 on:
   schedule:
-    - cron: '0 8 * * 1'   # щопонеділка 10:00 Варшава (2 год після основного sync о 8:00)
+    - cron: '0 8 * * 1'   # щопонеділка 10:00 Варшава (8:00 UTC), 2 год після daily sync
   workflow_dispatch:
     inputs:
       expro_ids:
@@ -107,55 +108,9 @@ jobs:
           print('config.py created')
           PYEOF
 
-      # ── expro_data.json: download fresh from server (api_scraper runs daily there) ──
-      - name: Download expro_data.json from server
-        env:
-          SSH_HOST:     ${{ secrets.SSH_HOST }}
-          SSH_PORT:     ${{ secrets.SSH_PORT }}
-          SSH_USERNAME: ${{ secrets.SSH_USERNAME }}
-          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
-        run: |
-          mkdir -p data
-          python3 - <<'PYEOF'
-          import os, sys, paramiko
-
-          host = os.environ['SSH_HOST']
-          port = int(os.environ.get('SSH_PORT', '65002'))
-          user = os.environ['SSH_USERNAME']
-          pw   = os.environ['SSH_PASSWORD']
-
-          ssh = paramiko.SSHClient()
-          ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-          ssh.connect(host, port=port, username=user, password=pw, timeout=30)
-
-          # Try api_scraper location first, fall back to legacy scraper location
-          candidates = [
-              '/home/u525644354/expro_scraper_run/data/expro_data.json',
-              '/home/u525644354/expro_sync/data/expro_data.json',
-              '/home/u525644354/domains/realsymanagement.pl/public_html/expro_sync/data/expro_data.json',
-          ]
-          sftp = ssh.open_sftp()
-          downloaded = False
-          for remote_path in candidates:
-              try:
-                  sftp.stat(remote_path)
-                  sftp.get(remote_path, 'data/expro_data.json')
-                  print(f'Downloaded from {remote_path}')
-                  downloaded = True
-                  break
-              except FileNotFoundError:
-                  continue
-          sftp.close()
-          ssh.close()
-
-          if not downloaded:
-              print('WARNING: expro_data.json not found on server — will try cache fallback')
-              sys.exit(0)   # non-fatal, cache restore step follows
-          PYEOF
-
-      # Fallback: restore expro_data.json from GitHub Actions cache if server had nothing
-      - name: Restore expro_data.json from cache (fallback)
-        if: ${{ !hashFiles('data/expro_data.json') }}
+      # expro_data.json: restore from cache (saved by daily expro-sync workflow).
+      # Overwrites the committed baseline with yesterday's fresh scrape.
+      - name: Restore expro_data.json from cache
         uses: actions/cache/restore@v4
         with:
           path: data/expro_data.json
@@ -163,16 +118,8 @@ jobs:
           restore-keys: |
             expro-data-
 
-      - name: Check expro_data.json exists
-        run: |
-          if [ ! -f data/expro_data.json ]; then
-            echo "ERROR: expro_data.json not available from server or cache"
-            exit 1
-          fi
-          python3 -c "import json; d=json.load(open('data/expro_data.json')); print(f'Loaded: {len(d)} investments, {sum(len(i.get(\"units\",[]))for i in d)} units')"
-
-      # ── amenity_data.json: persistent cache across runs ──
-      - name: Restore amenity cache (amenity_data.json)
+      # amenity_data.json: persistent cache — grows as more units are scraped
+      - name: Restore amenity cache
         uses: actions/cache/restore@v4
         with:
           path: data/amenity_data.json
@@ -180,23 +127,33 @@ jobs:
           restore-keys: |
             amenity-data-
 
-      - name: Show cache status
+      - name: Show data status
         run: |
-          if [ -f data/amenity_data.json ]; then
-            python3 -c "import json; d=json.load(open('data/amenity_data.json')); print(f'Amenity cache: {len(d)} units cached, {sum(1 for v in d.values() if v)} with data')"
-          else
-            echo "Amenity cache: empty (first run)"
-          fi
+          python3 - <<'EOF'
+          import json, os
+          if os.path.exists('data/expro_data.json'):
+              d = json.load(open('data/expro_data.json'))
+              units = sum(len(i.get('units',[])) for i in d)
+              print(f'expro_data.json: {len(d)} investments, {units} units')
+          else:
+              print('ERROR: expro_data.json missing!')
+              raise SystemExit(1)
+          if os.path.exists('data/amenity_data.json'):
+              a = json.load(open('data/amenity_data.json'))
+              print(f'amenity_data.json: {len(a)} cached, {sum(1 for v in a.values() if v)} with data')
+          else:
+              print('amenity_data.json: empty (first run)')
+          EOF
 
       - name: Run amenity_patch.py
         env:
-          EXPRO_USERNAME:   ${{ secrets.EXPRO_USERNAME }}
-          EXPRO_PASSWORD:   ${{ secrets.EXPRO_PASSWORD }}
-          AMENITY_WORKERS:  '5'
-          EXPRO_TEST_INV_ID: ${{ github.event.inputs.expro_ids || '' }}
+          EXPRO_USERNAME:    ${{ secrets.EXPRO_USERNAME }}
+          EXPRO_PASSWORD:    ${{ secrets.EXPRO_PASSWORD }}
+          AMENITY_WORKERS:   '5'
         run: |
-          if [ -n "$EXPRO_TEST_INV_ID" ]; then
-            python3 amenity_patch.py --expro-ids "$EXPRO_TEST_INV_ID"
+          IDS="${{ github.event.inputs.expro_ids }}"
+          if [ -n "$IDS" ]; then
+            python3 amenity_patch.py --expro-ids "$IDS"
           else
             python3 amenity_patch.py --all
           fi
@@ -208,42 +165,6 @@ jobs:
           path: data/amenity_data.json
           key: amenity-data-${{ github.run_id }}
 
-      # Upload amenity_data.json to server so other tools can use it
-      - name: Upload amenity_data.json to server
-        if: always()
-        env:
-          SSH_HOST:     ${{ secrets.SSH_HOST }}
-          SSH_PORT:     ${{ secrets.SSH_PORT }}
-          SSH_USERNAME: ${{ secrets.SSH_USERNAME }}
-          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
-        run: |
-          python3 - <<'PYEOF'
-          import os, paramiko
-
-          if not os.path.exists('data/amenity_data.json'):
-              print('No amenity_data.json to upload')
-              exit(0)
-
-          host = os.environ['SSH_HOST']
-          port = int(os.environ.get('SSH_PORT', '65002'))
-          user = os.environ['SSH_USERNAME']
-          pw   = os.environ['SSH_PASSWORD']
-
-          ssh = paramiko.SSHClient()
-          ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-          ssh.connect(host, port=port, username=user, password=pw, timeout=30)
-
-          sftp = ssh.open_sftp()
-          remote = '/home/u525644354/expro_scraper_run/data/amenity_data.json'
-          try:
-              sftp.put('data/amenity_data.json', remote)
-              print(f'Uploaded to {remote}')
-          except Exception as e:
-              print(f'Upload warning: {e}')
-          sftp.close()
-          ssh.close()
-          PYEOF
-
       - name: Re-sync mieszkania with amenity data
         run: python3 run.py mieszkania
 
@@ -252,12 +173,18 @@ jobs:
         run: |
           echo "## Amenity Patch — $(date '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
           if [ -f data/amenity_data.json ]; then
-            TOTAL=$(python3 -c "import json; d=json.load(open('data/amenity_data.json')); print(len(d))" 2>/dev/null)
-            WITH=$(python3 -c "import json; d=json.load(open('data/amenity_data.json')); print(sum(1 for v in d.values() if v))" 2>/dev/null)
-            echo "| Метрика | Значення |" >> $GITHUB_STEP_SUMMARY
-            echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-            echo "| Юнітів у кеші | $TOTAL |" >> $GITHUB_STEP_SUMMARY
-            echo "| З amenity даними | $WITH |" >> $GITHUB_STEP_SUMMARY
+            python3 - <<'EOF' >> $GITHUB_STEP_SUMMARY
+          import json
+          d = json.load(open('data/amenity_data.json'))
+          total = len(d)
+          with_data = sum(1 for v in d.values() if v)
+          has_balcony = sum(1 for v in d.values() if v.get('has_balcony'))
+          has_terrace = sum(1 for v in d.values() if v.get('has_terrace'))
+          print(f'| Юнітів у кеші | {total} |')
+          print(f'| З amenity даними | {with_data} |')
+          print(f'| З балконом | {has_balcony} |')
+          print(f'| З терасою | {has_terrace} |')
+          EOF
           fi
 
       - name: Upload logs as artifact
