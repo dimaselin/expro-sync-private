@@ -65,12 +65,18 @@ _pw_page = None
 def _get_expro_page():
     global _pw_page
     if _pw_page is None:
+        import os
         from playwright.sync_api import sync_playwright
-        from scraper import login as expro_login
+        from config import EXPRO
         _pw = sync_playwright().__enter__()
         browser = _pw.chromium.launch(headless=True)
-        _pw_page = browser.new_context(accept_downloads=True).new_page()
-        expro_login(_pw_page)
+        page = browser.new_context(accept_downloads=True).new_page()
+        page.goto(f"{EXPRO['base_url']}/user/login", wait_until='domcontentloaded', timeout=20_000)
+        page.fill('input[name="username"]', EXPRO['username'])
+        page.fill('input[name="password"]', EXPRO['password'])
+        page.click('button[type="submit"]')
+        page.wait_for_load_state('domcontentloaded', timeout=15_000)
+        _pw_page = page
     return _pw_page
 
 
