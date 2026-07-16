@@ -172,6 +172,15 @@ def run_mode(mode: str) -> bool:
             return False
         log('=== Pipeline complete ===')
 
+    if mode == 'amenity':
+        log('=== Starting amenity patch (Phase 2) ===')
+        amenity_args = ['--expro-ids', test_inv] if test_inv else ['--all']
+        if not _run_script('amenity_patch.py', amenity_args):
+            log('=== Amenity patch FAILED ===')
+            wp_finish(False, {}, error='amenity_patch.py exited with error')
+            return False
+        log('=== Amenity patch complete ===')
+
     wp_finish(True, {})
     return True
 
@@ -211,8 +220,8 @@ def main() -> None:
         return
 
     mode = sys.argv[1] if len(sys.argv) > 1 else 'all'
-    if mode not in ('all', 'scrape', 'sync', 'mieszkania', 'media', 'pipeline'):
-        print('Usage: python run.py [all|scrape|sync|mieszkania|media|pipeline|--daemon]')
+    if mode not in ('all', 'scrape', 'sync', 'mieszkania', 'media', 'pipeline', 'amenity'):
+        print('Usage: python run.py [all|scrape|sync|mieszkania|media|pipeline|amenity|--daemon]')
         sys.exit(1)
 
     ok = run_mode(mode)

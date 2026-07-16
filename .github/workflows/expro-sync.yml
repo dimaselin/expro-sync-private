@@ -15,6 +15,7 @@ on:
           - scrape
           - sync
           - mieszkania
+          - amenity
           - media
           - pipeline
       investment_id:
@@ -124,6 +125,14 @@ jobs:
           restore-keys: |
             expro-prev-
 
+      - name: Restore amenity cache (amenity_data.json)
+        uses: actions/cache/restore@v4
+        with:
+          path: data/amenity_data.json
+          key: amenity-data-${{ github.run_id }}
+          restore-keys: |
+            amenity-data-
+
       - name: Run sync
         env:
           EXPRO_TEST_INV_ID: ${{ github.event.inputs.investment_id || '' }}
@@ -135,6 +144,20 @@ jobs:
         with:
           path: data/expro_prev.json
           key: expro-prev-${{ github.run_id }}
+
+      - name: Save amenity cache (amenity_data.json)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/amenity_data.json
+          key: amenity-data-${{ github.run_id }}
+
+      - name: Save expro_data.json for amenity workflow
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/expro_data.json
+          key: expro-data-${{ github.run_id }}
 
       - name: Write job summary
         if: always()

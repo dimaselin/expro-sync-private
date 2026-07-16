@@ -13,9 +13,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from wp_sync import SSHClient, log
 
-DATA      = Path(__file__).parent / 'data' / 'expro_data.json'
-PROGRESS  = Path(__file__).parent / 'data' / 'mieszkania_sync_progress.json'
-LOG_FILE  = Path(__file__).parent / 'data' / 'mieszkania_sync.log'
+DATA         = Path(__file__).parent / 'data' / 'expro_data.json'
+AMENITY_DATA = Path(__file__).parent / 'data' / 'amenity_data.json'
+PROGRESS     = Path(__file__).parent / 'data' / 'mieszkania_sync_progress.json'
+LOG_FILE     = Path(__file__).parent / 'data' / 'mieszkania_sync.log'
 
 # ExPro IDs that are ONLY Dom — never overwrite their projekt_typ
 _DOM_ONLY_IDS = None  # type: ignore
@@ -94,6 +95,8 @@ foreach ($units as $u) {
     $uid = trim($u['realestate_id'] ?? '');
     if (!$uid) { $skipped++; continue; }
 
+    $unit_name = trim($u['name'] ?? $u['Nazwa'] ?? $uid);
+
     // ── Find existing property post ──────────────────────────────────────
     $existing = get_posts([
         'post_type'      => 'property',
@@ -104,7 +107,29 @@ foreach ($units as $u) {
         'post_status'    => 'any',
     ]);
 
-    $unit_name = trim($u['name'] ?? $u['Nazwa'] ?? $uid);
+    // ── UUID migration fallback ──────────────────────────────────────────
+    // Old scraper stored numeric realestate_id; API scraper uses UUID.
+    // When UUID not found, match by investment expro_id meta + unit name prefix.
+    // On match, migrate expro_unit_id to UUID (runs once per unit, then fast path).
+    if (empty($existing) && $unit_name && strpos($uid, '-') !== false) {
+        global $wpdb;
+        $found_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT p.ID FROM {$wpdb->posts} p
+             INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
+             WHERE p.post_type = 'property'
+               AND p.post_status != 'trash'
+               AND pm.meta_key = 'expro_id'
+               AND pm.meta_value = %s
+               AND p.post_title LIKE %s
+             LIMIT 1",
+            (string)$inv['expro_id'],
+            $wpdb->esc_like($unit_name) . '%'
+        ));
+        if ($found_id) {
+            $existing = [(int)$found_id];
+            update_post_meta((int)$found_id, 'expro_unit_id', $uid);
+        }
+    }
 
     // ── Price ────────────────────────────────────────────────────────────
     $price_raw = $u['price_raw'] ?? $u['Cena'] ?? '';
@@ -275,14 +300,10 @@ foreach ($units as $u) {
         'lokal_cena_m2'               => $price_m2,
         'lokal_status_expro'          => $status_key,
         'lokal_etap'                  => $etap,
-        // Unit amenities
-        'lokal_balkon'                => ($u['has_balcony'] ?? false) ? '1' : '0',
+        // Unit amenities — only write if explicitly provided (absent = preserve existing WP value)
         'lokal_balkon_m2'             => $u['balcony_area'] ?? '',
-        'lokal_taras'                 => ($u['has_terrace'] ?? false) ? '1' : '0',
         'lokal_taras_m2'              => $u['terrace_area'] ?? '',
-        'lokal_ogrodek'               => ($u['has_garden'] ?? false) ? '1' : '0',
         'lokal_ogrodek_m2'            => $u['garden_area'] ?? '',
-        'lokal_piwnica'               => ($u['has_basement'] ?? false) ? '1' : '0',
         // Investment extras
         'inw_winda'                   => $inv_extra['winda'] ?? '',
         'inw_parking_naziemne_cena'   => $inv_extra['parking_naziemne_cena'] ?? '',
@@ -299,6 +320,13 @@ foreach ($units as $u) {
     foreach ($metas as $k => $v) {
         update_post_meta($post_id, $k, (string)$v);
     }
+
+    // Unit amenities — only overwrite if scraper explicitly provided the key
+    if (array_key_exists('has_balcony',  $u)) update_post_meta($post_id, 'lokal_balkon',  $u['has_balcony']  ? '1' : '0');
+    if (array_key_exists('has_terrace',  $u)) update_post_meta($post_id, 'lokal_taras',   $u['has_terrace']  ? '1' : '0');
+    if (array_key_exists('has_garden',   $u)) update_post_meta($post_id, 'lokal_ogrodek', $u['has_garden']   ? '1' : '0');
+    if (array_key_exists('has_basement', $u)) update_post_meta($post_id, 'lokal_piwnica', $u['has_basement'] ? '1' : '0');
+    if (array_key_exists('has_garage',   $u)) update_post_meta($post_id, 'lokal_garaz',   $u['has_garage']   ? '1' : '0');
 
     // ── Taxonomies ───────────────────────────────────────────────────────
     wp_set_object_terms($post_id, [$label_tid], 'property_label');
@@ -319,21 +347,40 @@ foreach ($units as $u) {
     }
 
     // ── property_feature taxonomy ────────────────────────────────────────
+    $unit_amenity_names = ['Balkon', 'Taras', 'Ogródek', 'Garaż', 'Piwnica'];
+    $has_amenity_keys   = array_key_exists('has_balcony', $u) || array_key_exists('has_terrace', $u)
+                       || array_key_exists('has_garden',  $u) || array_key_exists('has_garage',  $u)
+                       || array_key_exists('has_basement',$u);
     $features = [];
-    if ($u['has_balcony'] ?? false)  $features[] = 'Balkon';
-    if ($u['has_terrace'] ?? false)  $features[] = 'Taras';
-    if ($u['has_garden']  ?? false)  $features[] = 'Ogródek';
-    if ($u['has_garage']  ?? false)  $features[] = 'Garaż';
-    if ($u['has_basement'] ?? false) $features[] = 'Piwnica';
-    if (!empty($inv_extra['winda']))      $features[] = 'Winda';
-    if (!empty($inv_extra['smart_home'])) $features[] = 'Smart Home';
-    if (!empty($inv_extra['stacja_ev']))  $features[] = 'Stacja EV';
-    if (!empty($inv_extra['miejsce_postojowe'])) $features[] = 'Miejsce postojowe';
+
+    if ($has_amenity_keys) {
+        // Full data from scraper — set amenities from scraper values
+        if ($u['has_balcony'] ?? false)  $features[] = 'Balkon';
+        if ($u['has_terrace'] ?? false)  $features[] = 'Taras';
+        if ($u['has_garden']  ?? false)  $features[] = 'Ogródek';
+        if ($u['has_garage']  ?? false)  $features[] = 'Garaż';
+        if ($u['has_basement'] ?? false) $features[] = 'Piwnica';
+    } else {
+        // No amenity data from scraper — preserve existing WP unit amenity terms
+        $ex_terms = wp_get_post_terms($post_id, 'property_feature', ['fields' => 'names']);
+        if (!is_wp_error($ex_terms)) {
+            foreach ($ex_terms as $tn) {
+                if (in_array($tn, $unit_amenity_names)) $features[] = $tn;
+            }
+        }
+    }
+
+    // Investment-level features — always refresh from current inv_extra
+    if (!empty($inv_extra['winda']))               $features[] = 'Winda';
+    if (!empty($inv_extra['smart_home']))           $features[] = 'Smart Home';
+    if (!empty($inv_extra['stacja_ev']))            $features[] = 'Stacja EV';
+    if (!empty($inv_extra['miejsce_postojowe']))    $features[] = 'Miejsce postojowe';
     if (!empty($inv_extra['komorki_lokatorskie'])) $features[] = 'Komórka lokatorska';
-    if (!empty($inv_extra['pod_klucz'])) $features[] = 'Wykończenie pod klucz';
+    if (!empty($inv_extra['pod_klucz']))            $features[] = 'Wykończenie pod klucz';
 
     if ($features) {
-        $feat_tids = [];
+        $features   = array_unique($features);
+        $feat_tids  = [];
         foreach ($features as $feat_name) {
             $ft = term_exists($feat_name, 'property_feature');
             if (!$ft) $ft = wp_insert_term($feat_name, 'property_feature');
@@ -645,6 +692,19 @@ def main():
         return
 
     all_data = json.loads(DATA.read_text('utf-8'))
+
+    # Merge Phase-2 amenity data (amenity_patch.py) into unit dicts if available
+    if AMENITY_DATA.exists():
+        amenity_cache = json.loads(AMENITY_DATA.read_text('utf-8'))
+        merged = 0
+        for inv in all_data:
+            for unit in inv.get('units', []):
+                uid = unit.get('realestate_id', '')
+                if uid in amenity_cache and amenity_cache[uid]:
+                    unit.update(amenity_cache[uid])
+                    merged += 1
+        _log(f'Amenity data merged for {merged} units from {AMENITY_DATA.name}')
+
     progress = _load_progress()
 
     if args.expro_ids:
