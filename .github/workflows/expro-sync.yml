@@ -30,15 +30,17 @@ concurrency:
 
 jobs:
   sync:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 360      # 6 год — вистачить навіть на перший повний scrape
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11 (CloudLinux)
-        run: echo "/opt/alt/python311/bin" >> $GITHUB_PATH
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
       - name: Install Python dependencies
         run: pip3 install -r requirements.txt
