@@ -358,12 +358,46 @@ _TYP_PATTERNS = [
 
 # ExPro sends "Mieszkanie" as unit type even for villas/row-houses/commercial.
 # These overrides prevent sync from reverting manually-corrected projekt_typ.
+# Kept permanently as a safety net even though detect_projekt_typ_from_name()
+# below now also catches most of these cases generically — overrides always
+# win first, so there's no conflict in leaving them here.
 _PROJEKT_TYP_OVERRIDES: dict[str, str] = {
     "7557": "dom",      # Wille Biskupin etap II
     "7293": "dom",      # Wille Biskupin etap I
     "6703": "dom",      # Nowa Winnica etap I - szeregi 9-12
     "6001": "usluga",   # Przystań Królewiecka III - lokale usługowe
+    # Found 2026-07-20 via full audit against live WP data: unit-type heuristic
+    # gives a WRONG *non-empty* result for these (so the `if value:` write guard
+    # doesn't protect them) and they were corrected in WP outside this pipeline —
+    # without this entry the next scheduled sync silently reverts them.
+    "7108": "mieszkanie",  # Zaciszny Ołtaszyn IV — mixed unit types (2 Mieszkanie/8 Dom),
+                            # "Dom" wrongly wins as dominant; name gives no keyword clue
+                            # so detect_projekt_typ_from_name() can't fix this one.
 }
+
+# Secondary signal from investment NAME, used only to correct the specific
+# failure mode where ExPro mislabels every unit as "Mieszkanie" even though
+# the investment is actually houses/commercial (see _PROJEKT_TYP_OVERRIDES
+# above for known cases). Verified 2026-07-20 against all 180 live investment
+# names: zero collisions — no investment currently classified "mieszkanie"
+# contains any of these keywords, so this can only ever move a *future*
+# investment away from an already-known-wrong "mieszkanie" guess.
+_NAME_TYP_PATTERNS = [
+    (["wille", "willa", " domy ", "domy ", "szereg", "bliźniak", "blizniak", "wolnostoj"], "dom"),
+    (["lokal usług", "lokale usług", "lokal użytk", "lokale użytk",
+      "firma wykończ", "wykończeni", "zarządzanie najmem", "zarzadzanie najmem"], "usluga"),
+]
+
+def detect_projekt_typ_from_name(inv: dict) -> str:
+    """Secondary signal: infer projekt_typ from investment name/description keywords."""
+    name = (inv.get("name") or "").lower()
+    if not name:
+        return ""
+    for patterns, val in _NAME_TYP_PATTERNS:
+        if any(p in name for p in patterns):
+            return val
+    return ""
+
 
 def detect_projekt_typ(inv: dict) -> str:
     """Detect projekt_typ from unit types in ExPro data."""
@@ -380,6 +414,20 @@ def detect_projekt_typ(inv: dict) -> str:
         if any(p in dominant for p in patterns):
             return val
     return ""
+
+
+def resolve_projekt_typ(expro_id, inv: dict) -> str:
+    """Final projekt_typ resolution: override > unit-heuristic (corrected by name
+    signal only in the known "everything mislabeled Mieszkanie" failure mode)."""
+    override = _PROJEKT_TYP_OVERRIDES.get(str(expro_id))
+    if override:
+        return override
+    heuristic = detect_projekt_typ(inv)
+    if heuristic == "mieszkanie":
+        by_name = detect_projekt_typ_from_name(inv)
+        if by_name:
+            return by_name
+    return heuristic
 
 
 def normalize_units(units: list) -> list:
@@ -534,7 +582,7 @@ def sync_investment(ssh: SSHClient, inv: dict) -> Tuple[str, Optional[int]]:
         m_del = re.match(r"od\s+(.+?)\s+do\s+\1$", delivery_raw.strip())
         delivery = m_del.group(1) if m_del else re.sub(r"^od\s+", "", delivery_raw)
 
-        projekt_typ = _PROJEKT_TYP_OVERRIDES.get(str(expro_id)) or detect_projekt_typ(inv)
+        projekt_typ = resolve_projekt_typ(expro_id, inv)
 
         meta_fields: list[tuple[str, str]] = [
             ("expro_id",              expro_id),
