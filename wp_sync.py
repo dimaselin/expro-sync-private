@@ -399,6 +399,36 @@ def detect_projekt_typ_from_name(inv: dict) -> str:
     return ""
 
 
+# ExPro also lists things that are not real, addressable real estate: pure
+# service companies (firma wykończeniowa, zarządzanie najmem — 0 units, just
+# a company profile) and manufacturer product catalogs (generic model/size
+# names instead of real units at a real address). These should never get a
+# published post on a real-estate site.
+_EXCLUDED_NON_REALESTATE_IDS: set[str] = {
+    "5520",  # Domy Modułowe - Wrocław — modular-home manufacturer catalog (unit
+             # names are model codes like "HAV"/"DAL_A", not real addressed lots)
+    "4844",  # Domy Modułowe — same manufacturer, same issue
+}
+
+def is_excluded_from_site(expro_id, inv: dict) -> bool:
+    """True if this investment must never get a published inwestycja post —
+    it isn't real, sellable/rentable real estate."""
+    if str(expro_id) in _EXCLUDED_NON_REALESTATE_IDS:
+        return True
+    no_units = not inv.get("units_count") and not inv.get("units")
+    no_building_type = not inv.get("building_type_id")
+    if no_units and no_building_type:
+        # Zero units AND no building_type_id = a service-company profile, not
+        # a property listing. units_count==0 alone is NOT enough — real
+        # pre-launch developments (units not listed yet) also have 0 units,
+        # but ExPro still tags them with a real building_type_id (verified:
+        # "Bulwar Północny", a genuine 145-flat pre-launch by Archicom, has
+        # units_count=0 but building_type_id="1" — every confirmed pure
+        # service-company profile has building_type_id=None).
+        return True
+    return False
+
+
 def detect_projekt_typ(inv: dict) -> str:
     """Detect projekt_typ from unit types in ExPro data."""
     units = inv.get("units", [])
@@ -518,7 +548,7 @@ def get_existing_hash(ssh: SSHClient, post_id: int) -> str:
 
 def sync_investment(ssh: SSHClient, inv: dict) -> Tuple[str, Optional[int]]:
     """
-    Returns ('created'|'updated'|'skipped'|'failed', post_id).
+    Returns ('created'|'updated'|'skipped'|'excluded'|'failed', post_id).
     """
     expro_id = inv.get("expro_id", "")
     name = inv.get("name", f"Inwestycja {expro_id}")
@@ -526,6 +556,18 @@ def sync_investment(ssh: SSHClient, inv: dict) -> Tuple[str, Optional[int]]:
 
     # check existing
     post_id = find_existing_post(ssh, expro_id)
+
+    if is_excluded_from_site(expro_id, inv):
+        if post_id:
+            try:
+                ssh.run_wp_cli(f"post update {post_id} --post_status=draft", timeout=30)
+                log(f"  EXCLUDED (not real estate) — set to draft: {name} (WP ID: {post_id})")
+            except Exception as e:
+                log(f"  EXCLUDED but draft-update failed for {name} (WP ID: {post_id}): {e}")
+        else:
+            log(f"  EXCLUDED (not real estate) — no post created: {name}")
+        return "excluded", post_id
+
     action = "update" if post_id else "create"
 
     # change detection
@@ -773,7 +815,7 @@ def main():
         ssh.close()
         sys.exit(1)
 
-    created = updated = skipped = failed = 0
+    created = updated = skipped = excluded = failed = 0
 
     for idx, inv in enumerate(investments, 1):
         log(f"[{idx}/{len(investments)}] {inv.get('name', inv.get('expro_id', '?'))}")
@@ -785,6 +827,8 @@ def main():
                 updated += 1
             elif result == "skipped":
                 skipped += 1
+            elif result == "excluded":
+                excluded += 1
             else:
                 failed += 1
         except Exception as e:
@@ -798,7 +842,8 @@ def main():
     log(
         f"\nSync complete: "
         f"{created} created, {updated} updated, "
-        f"{skipped} skipped (no changes), {failed} failed."
+        f"{skipped} skipped (no changes), {excluded} excluded (not real estate), "
+        f"{failed} failed."
     )
 
 
