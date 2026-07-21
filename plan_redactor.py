@@ -41,6 +41,23 @@ _KEYWORDS = [
     'sprzedaż mieszkań', 'sprzedaz mieszkan', 'sprzedaz@', 'ul.', 'www.',
 ]
 
+# Generic Polish real-estate/floor-plan vocabulary that legitimately recurs in
+# room labels, dimensions, and the legal disclaimer on every plan. These words
+# are excluded from extra_terms word-overlap matching even when they happen to
+# be part of an investment's name (e.g. "Elewator - Mieszkania i Lofty")
+# — otherwise every plan's "Wejście do mieszkania" / "Wysokość mieszkania"
+# label and the disclaimer paragraph (which mentions "aranżacji mieszkania")
+# get wrongly blurred just because they share the word "mieszkania".
+_GENERIC_WORDS = {
+    'mieszkanie', 'mieszkania', 'mieszkań', 'mieszkaniu', 'mieszkaniem',
+    'dom', 'domu', 'domy', 'domów', 'lokal', 'lokalu', 'lokum',
+    'budynek', 'budynku', 'budynki', 'inwestycja', 'inwestycji',
+    'parking', 'piwnica', 'piwnicy', 'balkon', 'balkonu', 'taras', 'tarasu',
+    'strefa', 'strefy', 'klatka', 'klatki', 'schodowa', 'winda', 'windy',
+    'korytarz', 'korytarza', 'wysokość', 'wysokości', 'powierzchnia',
+    'powierzchni', 'wejście', 'wejscie', 'rzut', 'plan', 'piętro', 'pietro',
+}
+
 
 def is_blocked_text(text: str, extra_terms: list) -> bool:
     """True if this OCR'd text token should be redacted."""
@@ -78,12 +95,19 @@ def is_blocked_text(text: str, extra_terms: list) -> bool:
         # Tesseract detects text per-word/per-line, not per-phrase — the
         # investment name "Elewator - Mieszkania i Lofty" never appears as a
         # single OCR token, only fragments like "ELEWATOR" on their own line.
-        if term in tl or tl in term:
+        # The "tl in term" direction needs a length floor: without it, a
+        # single short conjunction like "i" (or "w", "z", "do") is trivially
+        # a substring of almost any long investment name and wrongly matches.
+        if term in tl or (len(tl) >= 4 and tl in term):
             return True
-        # Word-level overlap: any distinctive (4+ char) word shared between
-        # the known term and the OCR'd text, e.g. "ELEWATOR" line matching
-        # the "Elewator - Mieszkania i Lofty" investment name.
-        term_words = [w for w in re.findall(r'\w+', term) if len(w) >= 4]
+        # Word-level overlap: any distinctive (4+ char, non-generic) word
+        # shared between the known term and the OCR'd text, e.g. "ELEWATOR"
+        # line matching the "Elewator - Mieszkania i Lofty" investment name.
+        # Generic real-estate words (see _GENERIC_WORDS) are excluded even
+        # when part of the term name, since they recur constantly in
+        # legitimate room labels and the plan's legal disclaimer.
+        term_words = [w for w in re.findall(r'\w+', term)
+                       if len(w) >= 4 and w not in _GENERIC_WORDS]
         if any(w in text_words for w in term_words):
             return True
     return False
