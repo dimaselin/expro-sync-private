@@ -35,7 +35,15 @@ _EMAIL_RE = re.compile(r'[\w.+-]+@[\w-]+\.\w+', re.I)
 _DOMAIN_RE = re.compile(r'\b[\w-]+\.(pl|com|eu|info)\b', re.I)
 _POSTAL_RE = re.compile(r'\b\d{2}-\d{3}\b')
 _PHONE_KEYWORD_RE = re.compile(r'\btel\b\.?:?', re.I)
-_PHONE_DIGITS_RE = re.compile(r'(\d[\d\s.\-oO]{6,}\d)')  # tolerate OCR 0/O confusion
+# Anchored to the WHOLE token (not just a substring) so a floor-plan scale
+# bar like "0 100 200cm" doesn't match — the trailing unit letters would
+# otherwise be ignored by a plain .search() that only needs *some* digit run
+# inside the token.
+_PHONE_DIGITS_RE = re.compile(r'^\d[\d\s.\-oO]{6,}\d$')  # tolerate OCR 0/O confusion
+# A bare revision-date stamp ("15.06.2026") structurally looks just like a
+# phone number to _PHONE_DIGITS_RE (digits separated by dots) but isn't
+# developer/investment-identifying info at all — exclude it explicitly.
+_DATE_RE = re.compile(r'^\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}$')
 _KEYWORDS = [
     'biuro sprzedaży', 'biuro sprzedazy', 'dział sprzedaży', 'dzial sprzedazy',
     'sprzedaż mieszkań', 'sprzedaz mieszkan', 'sprzedaz@', 'ul.', 'www.',
@@ -56,6 +64,7 @@ _GENERIC_WORDS = {
     'strefa', 'strefy', 'klatka', 'klatki', 'schodowa', 'winda', 'windy',
     'korytarz', 'korytarza', 'wysokość', 'wysokości', 'powierzchnia',
     'powierzchni', 'wejście', 'wejscie', 'rzut', 'plan', 'piętro', 'pietro',
+    'osiedle', 'osiedla', 'osiedlu',
 }
 
 
@@ -77,9 +86,14 @@ def is_blocked_text(text: str, extra_terms: list) -> bool:
     # phone number OCRs as its own short token; long sentences that merely
     # contain a date or a regulation/article number (common in the legal
     # disclaimer every plan carries) must not match just because they have
-    # 7+ digits somewhere inside.
+    # 7+ digits somewhere inside. _PHONE_DIGITS_RE is now whole-token
+    # anchored (see definition) to exclude a scale-bar label like
+    # "0 100 200cm", and a plain revision-date stamp ("15.06.2026") is
+    # excluded explicitly — it looks identical in shape to a phone number
+    # but isn't developer/investment-identifying info.
     digits_only = re.sub(r'\D', '', t)
-    if len(t) <= 20 and _PHONE_DIGITS_RE.search(t) and len(digits_only) >= 7:
+    if (len(t) <= 20 and not _DATE_RE.match(t)
+            and _PHONE_DIGITS_RE.match(t) and len(digits_only) >= 7):
         return True
     for kw in _KEYWORDS:
         if kw in tl:
@@ -113,8 +127,30 @@ def is_blocked_text(text: str, extra_terms: list) -> bool:
     return False
 
 
+# Signals that are fully self-contained within a single OCR token — an email
+# address, a domain, or a postal code never needs neighboring words to be
+# recognized as identifying info. These are the only signals eligible for
+# the tight-box fallback below; _KEYWORDS phrases like "ul." and extra_terms
+# name fragments are deliberately excluded because they're prefixes/partial
+# matches whose whole point is to catch the surrounding words too (e.g. "ul."
+# alone is meaningless — the actual street address is what needs hiding).
+def _self_complete_hit(word_text: str) -> bool:
+    t = word_text.strip()
+    return bool(t) and bool(_EMAIL_RE.search(t) or _DOMAIN_RE.search(t) or _POSTAL_RE.search(t))
+
+
+# Above this line length, a match is assumed to be a long legal-disclaimer
+# or legend sentence that merely *contains* a legitimate short signal (most
+# often a developer's domain tacked on as a footer) rather than being an
+# identity/contact line in its own right — verified against a live batch
+# run where a 179-char disclaimer sentence ending in "dekpoldeweloper.pl"
+# got fully blurred, while every real contact/address line observed stayed
+# under 65 chars.
+_LONG_LINE_CHARS = 100
+
+
 def _ocr_lines(image_path: str, langs: str = 'pol+eng'):
-    """Yield (text, confidence_0_100, (x0,y0,x1,y1)) per detected LINE.
+    """Yield (text, confidence_0_100, (x0,y0,x1,y1), words) per detected LINE.
 
     Tesseract's image_to_data() returns per-WORD boxes, but multi-word
     phrases (phone numbers with spaces, "Biuro sprzedaży", investment names
@@ -123,7 +159,9 @@ def _ocr_lines(image_path: str, langs: str = 'pol+eng'):
     itself. Words are grouped by Tesseract's own (block, paragraph, line)
     indices and rejoined in reading order; the line's bounding box is the
     union of its words' boxes, so blurring still stays tight around only the
-    text that was actually flagged.
+    text that was actually flagged. `words` (a list of (text, box) pairs) is
+    also yielded so callers can fall back to a tighter per-word box on long
+    lines — see _LONG_LINE_CHARS.
     """
     data = pytesseract.image_to_data(Image.open(image_path), lang=langs,
                                       output_type=pytesseract.Output.DICT)
@@ -137,9 +175,9 @@ def _ocr_lines(image_path: str, langs: str = 'pol+eng'):
         x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
         key = (data['block_num'][i], data['par_num'][i], data['line_num'][i])
         entry = lines.setdefault(key, {'words': [], 'confs': [], 'box': None})
-        entry['words'].append((data['word_num'][i], text))
-        entry['confs'].append(conf)
         box = (x, y, x + w, y + h)
+        entry['words'].append((data['word_num'][i], text, box))
+        entry['confs'].append(conf)
         if entry['box'] is None:
             entry['box'] = box
         else:
@@ -148,10 +186,11 @@ def _ocr_lines(image_path: str, langs: str = 'pol+eng'):
                              max(bx1, box[2]), max(by1, box[3]))
 
     for entry in lines.values():
-        words = [w for _, w in sorted(entry['words'])]
-        line_text = ' '.join(words)
+        ordered = sorted(entry['words'])
+        words = [(w, b) for _, w, b in ordered]
+        line_text = ' '.join(w for w, _ in words)
         line_conf = max(entry['confs']) if entry['confs'] else -1
-        yield line_text, line_conf, entry['box']
+        yield line_text, line_conf, entry['box'], words
 
 
 def redact_plan_image(image_path: str, extra_terms: list = None, pad: int = 6,
@@ -169,15 +208,33 @@ def redact_plan_image(image_path: str, extra_terms: list = None, pad: int = 6,
     draw = ImageDraw.Draw(mask)
 
     hits = []
-    for text, conf, box in _ocr_lines(image_path):
+    for text, conf, box, words in _ocr_lines(image_path):
         if conf < min_conf:
             continue
-        if is_blocked_text(text, extra_terms):
-            x0, y0, x1, y1 = box
-            padded = (max(0, x0 - pad), max(0, y0 - pad),
-                      min(img.width, x1 + pad), min(img.height, y1 + pad))
-            draw.rectangle(padded, fill=255)
-            hits.append((text, conf, padded))
+        if not is_blocked_text(text, extra_terms):
+            continue
+        target_box = box
+        target_text = text
+        if len(text) > _LONG_LINE_CHARS:
+            self_hits = [(w, b) for w, b in words if _self_complete_hit(w)]
+            if self_hits:
+                xs0 = min(b[0] for _, b in self_hits)
+                ys0 = min(b[1] for _, b in self_hits)
+                xs1 = max(b[2] for _, b in self_hits)
+                ys1 = max(b[3] for _, b in self_hits)
+                target_box = (xs0, ys0, xs1, ys1)
+                target_text = ' '.join(w for w, _ in self_hits)
+            else:
+                # Long line matched only via a multi-word signal (phone
+                # digits split across words, a keyword phrase, extra_terms)
+                # with no single self-contained word to fall back to —
+                # skip rather than risk blurring an entire long sentence.
+                continue
+        x0, y0, x1, y1 = target_box
+        padded = (max(0, x0 - pad), max(0, y0 - pad),
+                  min(img.width, x1 + pad), min(img.height, y1 + pad))
+        draw.rectangle(padded, fill=255)
+        hits.append((target_text, conf, padded))
 
     if hits:
         out = Image.composite(blurred_full, img, mask)

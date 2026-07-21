@@ -188,7 +188,12 @@ def run_mode(mode: str) -> bool:
         # EXPRO_TEST_INV_ID is reused here to mean property POST IDs (not
         # ExPro investment IDs) for a small-sample test run.
         log('=== Starting floor plan redaction (existing images) ===')
-        redact_args = ['--post-ids', test_inv] if test_inv else ['--all']
+        # --resume is always safe here: the workflow now caches
+        # redact_plans_progress.json across dispatches (a single ~3800-image
+        # pass takes longer than a GitHub-hosted runner's 6h ceiling, and a
+        # dropped SSH connection can also end a run early), and 'error'
+        # entries are retried rather than skipped (see main()'s resume check).
+        redact_args = ['--post-ids', test_inv] if test_inv else ['--all', '--resume']
         if os.environ.get('EXPRO_REDACT_DRY_RUN', '').strip().lower() == 'true':
             redact_args.append('--dry-run')
             log('DRY RUN: scanning only, no server writes')

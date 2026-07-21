@@ -92,8 +92,18 @@ echo json_encode($rows);
     return json.loads(out)
 
 
-def process_one(ssh: SSHClient, sftp, target: dict, dry_run: bool) -> str:
-    """Returns 'redacted' | 'clean' | 'error'."""
+def process_one(ssh: SSHClient, target: dict, dry_run: bool) -> str:
+    """Returns 'redacted' | 'clean' | 'error'.
+
+    Opens its own short-lived SFTP session rather than reusing one held for
+    the whole batch — a multi-hour run over a shared-hosting SSH connection
+    WILL drop at some point (confirmed live: it dropped after ~1h, killing
+    ~3100 of 3812 items with "Socket is closed" since the single sftp handle
+    captured before the loop started pointed at a transport that was gone,
+    even though wp_sync's own _ensure_connected() reconnected `ssh._client`
+    for the wp-cli calls). A fresh sftp handle per item is always bound to
+    whatever connection is currently live.
+    """
     att_id = int(target['plan_att_id'])
     php = f"""<?php echo wp_get_attachment_url({att_id}) ?: ''; echo "\\n"; echo get_attached_file({att_id}) ?: '';"""
     ssh.write_remote_file(php, "/tmp/esm_redact_geturl.php")
@@ -106,7 +116,12 @@ def process_one(ssh: SSHClient, sftp, target: dict, dry_run: bool) -> str:
     with tempfile.NamedTemporaryFile(suffix=Path(remote_file_path).suffix, delete=False) as tmp:
         local_path = tmp.name
     try:
-        sftp.get(remote_file_path, local_path)
+        ssh._ensure_connected()
+        sftp = ssh._client.open_sftp()
+        try:
+            sftp.get(remote_file_path, local_path)
+        finally:
+            sftp.close()
         extra_terms = [target.get('developer') or '', target.get('inv_name') or '']
         hits = redact_plan_image(local_path, extra_terms=extra_terms)
         if not hits:
@@ -121,7 +136,12 @@ def process_one(ssh: SSHClient, sftp, target: dict, dry_run: bool) -> str:
             ssh.run(f"mkdir -p {shlex.quote(BACKUP_DIR)} && "
                     f"cp {shlex.quote(remote_file_path)} {shlex.quote(backup_path)}",
                     timeout=30)
-            sftp.put(local_path, remote_file_path)
+            ssh._ensure_connected()
+            sftp = ssh._client.open_sftp()
+            try:
+                sftp.put(local_path, remote_file_path)
+            finally:
+                sftp.close()
         return 'redacted'
     finally:
         try:
@@ -149,7 +169,6 @@ def main():
 
     ssh = SSHClient()
     ssh._connect()
-    sftp = ssh._client.open_sftp()
 
     log("Fetching plan targets...")
     targets = fetch_plan_targets(ssh, post_ids)
@@ -160,22 +179,31 @@ def main():
 
     for i, t in enumerate(targets, 1):
         pid = str(t['post_id'])
-        if args.resume and progress.get(pid):
+        # Only skip items that actually finished — an 'error' entry from a
+        # prior interrupted run (e.g. the connection drop this fix addresses)
+        # must be retried, not treated as done forever.
+        if args.resume and progress.get(pid) in ('redacted', 'clean'):
             stats['skipped'] += 1
             continue
         log(f"[{i}/{len(targets)}] post {pid} ({t.get('inv_name') or '?'})")
         try:
-            result = process_one(ssh, sftp, t, args.dry_run)
+            result = process_one(ssh, t, args.dry_run)
         except Exception as e:
-            log(f"  ERROR: {e}")
-            result = 'error'
+            # One retry after forcing a reconnect — covers a connection that
+            # dies mid-transfer on this specific item, not just between items.
+            log(f"  WARN: {e} — retrying once after reconnect")
+            try:
+                ssh._client = None
+                result = process_one(ssh, t, args.dry_run)
+            except Exception as e2:
+                log(f"  ERROR: {e2}")
+                result = 'error'
         stats[result] += 1
         progress[pid] = result
         if i % 20 == 0:
             _save_progress(progress)
 
     _save_progress(progress)
-    sftp.close()
     ssh.close()
     log(f"\nDone. {stats}")
 

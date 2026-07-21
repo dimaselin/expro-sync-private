@@ -142,6 +142,15 @@ jobs:
           restore-keys: |
             amenity-data-
 
+      - name: Restore redact progress cache (redact_plans_progress.json)
+        if: ${{ github.event.inputs.mode == 'redact' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: data/redact_plans_progress.json
+          key: redact-progress-${{ github.run_id }}
+          restore-keys: |
+            redact-progress-
+
       - name: Run sync
         env:
           EXPRO_TEST_INV_ID: ${{ github.event.inputs.investment_id || '' }}
@@ -161,6 +170,13 @@ jobs:
         with:
           path: data/amenity_data.json
           key: amenity-data-${{ github.run_id }}
+
+      - name: Save redact progress cache (redact_plans_progress.json)
+        if: ${{ always() && github.event.inputs.mode == 'redact' }}
+        uses: actions/cache/save@v4
+        with:
+          path: data/redact_plans_progress.json
+          key: redact-progress-${{ github.run_id }}
 
       - name: Save expro_data.json for amenity workflow
         if: always()
