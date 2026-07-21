@@ -18,8 +18,9 @@ on:
           - amenity
           - media
           - pipeline
+          - redact
       investment_id:
-        description: 'Тест: ExPro ID інвестиції (напр. 7567). Порожньо = всі.'
+        description: 'Тест: ExPro ID інвестиції (напр. 7567), або для redact — WP post ID(s) через кому. Порожньо = всі.'
         required: false
         default: ''
         type: string

@@ -181,6 +181,20 @@ def run_mode(mode: str) -> bool:
             return False
         log('=== Amenity patch complete ===')
 
+    if mode == 'redact':
+        # Not part of 'all' — a deliberate, manually-triggered one-off batch
+        # cleanup of already-imported plan images, separate from the
+        # per-sync redaction new plans already get automatically.
+        # EXPRO_TEST_INV_ID is reused here to mean property POST IDs (not
+        # ExPro investment IDs) for a small-sample test run.
+        log('=== Starting floor plan redaction (existing images) ===')
+        redact_args = ['--post-ids', test_inv] if test_inv else ['--all']
+        if not _run_script('redact_existing_plans.py', redact_args):
+            log('=== Plan redaction FAILED ===')
+            wp_finish(False, {}, error='redact_existing_plans.py exited with error')
+            return False
+        log('=== Plan redaction complete ===')
+
     wp_finish(True, {})
     return True
 
@@ -220,8 +234,8 @@ def main() -> None:
         return
 
     mode = sys.argv[1] if len(sys.argv) > 1 else 'all'
-    if mode not in ('all', 'scrape', 'sync', 'mieszkania', 'media', 'pipeline', 'amenity'):
-        print('Usage: python run.py [all|scrape|sync|mieszkania|media|pipeline|amenity|--daemon]')
+    if mode not in ('all', 'scrape', 'sync', 'mieszkania', 'media', 'pipeline', 'amenity', 'redact'):
+        print('Usage: python run.py [all|scrape|sync|mieszkania|media|pipeline|amenity|redact|--daemon]')
         sys.exit(1)
 
     ok = run_mode(mode)
