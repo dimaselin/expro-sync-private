@@ -24,6 +24,11 @@ on:
         required: false
         default: ''
         type: string
+      dry_run:
+        description: 'redact only: сканувати й показати, що буде розмито, без запису на сервер'
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: expro-sync
@@ -140,6 +145,7 @@ jobs:
       - name: Run sync
         env:
           EXPRO_TEST_INV_ID: ${{ github.event.inputs.investment_id || '' }}
+          EXPRO_REDACT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: python3 run.py ${{ github.event.inputs.mode || 'all' }}
 
       - name: Save unit photo cache (expro_prev.json)
