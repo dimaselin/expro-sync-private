@@ -419,7 +419,14 @@ foreach ($units as $u) {
 
     // ── Floor plan ───────────────────────────────────────────────────────
     // Plan is always the main card image (_thumbnail_id)
+    // ExPro returns its own company logo (expander-logo-new.png) as
+    // plan_urls[0]/photo_urls[0] for units that genuinely have no floor
+    // plan uploaded on their side — not an empty value, a real image URL
+    // that happens to be their branding. Importing it verbatim makes the
+    // unit LOOK like it has a photo (thumbnail is set) when it doesn't.
+    // Treat it as "no plan available" instead of real content.
     $plan_url        = $u['plan_urls'][0] ?? '';
+    if (str_contains($plan_url, 'expander-logo')) $plan_url = '';
     $plan_server_map = $u['plan_server_map'] ?? [];
     $plan_att        = (int)get_post_meta($post_id, 'lokal_plan_attachment_id', true);
 

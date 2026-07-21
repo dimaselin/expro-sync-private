@@ -113,7 +113,12 @@ def import_media_for(ssh: SSHClient, post_id: int, inv: dict, skip_existing: boo
     except Exception:
         existing_gallery = ''
 
-    images = inv.get('images', [])
+    # Same ExPro-own-logo-as-placeholder issue as unit plan_urls (see
+    # mieszkania_sync.py) can show up in the investment-level gallery too —
+    # filter it out here so it never becomes projekt_galeria/_thumbnail_id,
+    # which individual units fall back to when they have no gallery of
+    # their own (mieszkania_sync.py's "reuse parent thumbnail" path).
+    images = [u for u in inv.get('images', []) if 'expander-logo' not in u]
     if images and (not existing_gallery or not skip_existing):
         log(f'  Importing {len(images)} gallery images…')
         img_ids = []
