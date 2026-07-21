@@ -160,9 +160,21 @@ def fetch_all_investments(token: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def fetch_units_list(token: str, inv_uuid: str) -> list[dict]:
-    """GET /api/realestate/?investment_id={uuid} — handles pagination."""
+    """GET /api/realestate/?investment_id={uuid} — handles pagination.
+
+    Deduplicates by "uuid": for large investments (~100+ units) ExPro's API
+    has been observed returning the exact same page content again for
+    page=2 (confirmed byte-for-byte identical payload, same uuid) instead
+    of the next page — so pagination alone can silently double every unit.
+    Verified 2026-07-21 against Lokum PORTO (expro_id 2463): raw fetch
+    returned 200 entries for 100 real units, unit[0] and unit[100]
+    byte-identical including uuid. Dedup here guards every downstream
+    consumer (mieszkania_sync.py, single-inwestycja-mieszkania.php's
+    rendered unit table/cards) without needing a fix in each of them.
+    """
     headers = make_headers(token)
     all_units: list[dict] = []
+    seen_uuids: set[str] = set()
     page = 1
     while True:
         resp = requests.get(
@@ -176,7 +188,22 @@ def fetch_units_list(token: str, inv_uuid: str) -> list[dict]:
         payload = data.get("payload", [])
         if not payload:
             break
-        all_units.extend(payload)
+        new_count = 0
+        for u in payload:
+            uid = u.get("uuid")
+            if uid and uid in seen_uuids:
+                continue
+            if uid:
+                seen_uuids.add(uid)
+            all_units.append(u)
+            new_count += 1
+        if new_count == 0:
+            # This page added nothing we hadn't already seen — either we're
+            # truly done, or the API is repeating a page (the bug this
+            # function guards against). Either way, stop: if totalItems is
+            # ALSO inflated by the same duplication, len(all_units) would
+            # never reach it and this would otherwise loop forever.
+            break
         paginator = data.get("paginator", {})
         total = int(paginator.get("totalItems", 0))
         if len(all_units) >= total:
