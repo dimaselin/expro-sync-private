@@ -42,6 +42,9 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install Tesseract OCR (floor plan redaction)
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr tesseract-ocr-pol
+
       - name: Install Python dependencies
         run: pip3 install -r requirements.txt
 

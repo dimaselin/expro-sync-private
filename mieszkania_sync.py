@@ -13,6 +13,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from wp_sync import SSHClient, log
 
+try:
+    from plan_redactor import redact_plan_image
+except ImportError:
+    redact_plan_image = None  # tesseract/pytesseract not installed — skip redaction gracefully
+
 DATA         = Path(__file__).parent / 'data' / 'expro_data.json'
 AMENITY_DATA = Path(__file__).parent / 'data' / 'amenity_data.json'
 PROGRESS     = Path(__file__).parent / 'data' / 'mieszkania_sync_progress.json'
@@ -506,9 +511,18 @@ def get_projekt_term_id(ssh: SSHClient, post_id: int) -> int:
     return int(out.strip() or '0')
 
 
-def upload_unit_images(ssh: SSHClient, units: list[dict], server_base: str = '/tmp/esm_imgs') -> None:
+def upload_unit_images(ssh: SSHClient, units: list[dict], extra_terms: list = None,
+                        server_base: str = '/tmp/esm_imgs') -> None:
     """SFTP-upload unit floor plan images to WP server before PHP import.
-    Gallery photos are taken from investment-level projekt_galeria — no upload needed."""
+    Gallery photos are taken from investment-level projekt_galeria — no upload needed.
+
+    Before uploading, each plan image is checked for developer/investment
+    name, sales-office phone/email/address baked into the image itself
+    (common — different developers export their floor plans from their own
+    branded PDF template) and blurred in place. extra_terms should be the
+    developer name and investment name for THIS investment, on top of the
+    universal phone/email/website/address patterns plan_redactor already
+    checks unconditionally."""
     files_to_upload = []
     for unit in units:
         rid = unit.get('realestate_id', '')
@@ -521,6 +535,20 @@ def upload_unit_images(ssh: SSHClient, units: list[dict], server_base: str = '/t
 
     if not files_to_upload:
         return
+
+    if redact_plan_image is not None:
+        redacted_count = 0
+        for _, _, local in files_to_upload:
+            try:
+                hits = redact_plan_image(local, extra_terms=extra_terms or [])
+                if hits:
+                    redacted_count += 1
+            except Exception as e:
+                log(f'  WARN: plan redaction failed for {local}: {e}')
+        if redacted_count:
+            log(f'  Redacted identifying text on {redacted_count}/{len(files_to_upload)} plan image(s)')
+    else:
+        log('  WARN: pytesseract not installed — skipping plan redaction (tesseract-ocr missing?)')
 
     sftp = ssh._client.open_sftp()
     try:
@@ -571,8 +599,11 @@ def sync_units(ssh: SSHClient, inv: dict, parent_id: int, projekt_term_id: int) 
         'projekt_term_id': projekt_term_id,
     }
 
-    # Upload unit images to server (authenticated download already done by scraper)
-    upload_unit_images(ssh, units)
+    # Upload unit images to server (authenticated download already done by scraper).
+    # Developer/investment name passed through so plan_redactor can blur them
+    # if they're baked into the plan image itself (on top of the universal
+    # phone/email/website/address patterns it always checks).
+    upload_unit_images(ssh, units, extra_terms=[inv.get('developer', ''), inv.get('name', '')])
 
     data_json = json.dumps(payload, ensure_ascii=False)
     ssh.write_remote_file(data_json, '/tmp/esm_units_data.json')
