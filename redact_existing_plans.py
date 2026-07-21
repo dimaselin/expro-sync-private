@@ -16,18 +16,32 @@ Usage:
 """
 import argparse
 import json
+import shlex
 import sys
 import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from wp_sync import SSHClient, log
+from wp_sync import SSHClient, WP_PATH, log
 
 try:
     from plan_redactor import redact_plan_image
 except ImportError:
     print("ERROR: pip install pytesseract Pillow (and apt-get install tesseract-ocr tesseract-ocr-pol)")
     sys.exit(1)
+
+# Outside public_html so backups are never web-served. A false positive in
+# the OCR blocklist (e.g. a generic word from an investment name matching a
+# legitimate floor-plan label) overwrites the live file in place with no
+# other copy anywhere — this happened for real during testing (see git log)
+# and required manually re-downloading the original from ExPro to recover.
+# Every file this script touches gets backed up here first so a bad batch
+# run can be rolled back with a plain `cp` instead of a source re-fetch.
+# Derived from WP_PATH (.../domains/<site>/public_html) rather than "~" —
+# shlex.quote() wraps "~" in single quotes, which disables shell tilde
+# expansion, so a literal home-dir path is needed instead.
+_HOME_DIR = WP_PATH.split('/domains/')[0]
+BACKUP_DIR = f'{_HOME_DIR}/esm_plan_backups'
 
 PROGRESS_FILE = Path(__file__).parent / 'data' / 'redact_plans_progress.json'
 
@@ -100,6 +114,13 @@ def process_one(ssh: SSHClient, sftp, target: dict, dry_run: bool) -> str:
         log(f"    post {target['post_id']}: blurred {len(hits)} region(s): "
             f"{[h[0] for h in hits]}")
         if not dry_run:
+            # Back up the still-pristine remote file before overwriting it —
+            # a bad OCR match overwrites the only copy of the live image
+            # with no other trace of the original anywhere.
+            backup_path = f"{BACKUP_DIR}/{att_id}{Path(remote_file_path).suffix}"
+            ssh.run(f"mkdir -p {shlex.quote(BACKUP_DIR)} && "
+                    f"cp {shlex.quote(remote_file_path)} {shlex.quote(backup_path)}",
+                    timeout=30)
             sftp.put(local_path, remote_file_path)
         return 'redacted'
     finally:
