@@ -67,24 +67,67 @@ def is_blocked_text(text: str, extra_terms: list) -> bool:
     for kw in _KEYWORDS:
         if kw in tl:
             return True
+    text_words = set(re.findall(r'\w+', tl))
     for term in extra_terms:
-        if term and str(term).strip().lower() in tl:
+        term = str(term or '').strip().lower()
+        if not term:
+            continue
+        # Either direction: a short OCR token can be a substring of a long
+        # investment name, or (rarely) the whole term can appear in a longer
+        # OCR'd line. A plain "term in tl" check alone misses this because
+        # Tesseract detects text per-word/per-line, not per-phrase — the
+        # investment name "Elewator - Mieszkania i Lofty" never appears as a
+        # single OCR token, only fragments like "ELEWATOR" on their own line.
+        if term in tl or tl in term:
+            return True
+        # Word-level overlap: any distinctive (4+ char) word shared between
+        # the known term and the OCR'd text, e.g. "ELEWATOR" line matching
+        # the "Elewator - Mieszkania i Lofty" investment name.
+        term_words = [w for w in re.findall(r'\w+', term) if len(w) >= 4]
+        if any(w in text_words for w in term_words):
             return True
     return False
 
 
-def _ocr_words(image_path: str, langs: str = 'pol+eng'):
-    """Yield (text, confidence_0_100, (x0,y0,x1,y1)) per detected word."""
+def _ocr_lines(image_path: str, langs: str = 'pol+eng'):
+    """Yield (text, confidence_0_100, (x0,y0,x1,y1)) per detected LINE.
+
+    Tesseract's image_to_data() returns per-WORD boxes, but multi-word
+    phrases (phone numbers with spaces, "Biuro sprzedaży", investment names
+    split across words) need to be matched as a whole — a lone "536" or
+    "Biuro" token doesn't look like a phone number or sales-office keyword by
+    itself. Words are grouped by Tesseract's own (block, paragraph, line)
+    indices and rejoined in reading order; the line's bounding box is the
+    union of its words' boxes, so blurring still stays tight around only the
+    text that was actually flagged.
+    """
     data = pytesseract.image_to_data(Image.open(image_path), lang=langs,
                                       output_type=pytesseract.Output.DICT)
     n = len(data['text'])
+    lines = {}
     for i in range(n):
         text = data['text'][i].strip()
         if not text:
             continue
         conf = int(data['conf'][i]) if str(data['conf'][i]).lstrip('-').isdigit() else -1
         x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
-        yield text, conf, (x, y, x + w, y + h)
+        key = (data['block_num'][i], data['par_num'][i], data['line_num'][i])
+        entry = lines.setdefault(key, {'words': [], 'confs': [], 'box': None})
+        entry['words'].append((data['word_num'][i], text))
+        entry['confs'].append(conf)
+        box = (x, y, x + w, y + h)
+        if entry['box'] is None:
+            entry['box'] = box
+        else:
+            bx0, by0, bx1, by1 = entry['box']
+            entry['box'] = (min(bx0, box[0]), min(by0, box[1]),
+                             max(bx1, box[2]), max(by1, box[3]))
+
+    for entry in lines.values():
+        words = [w for _, w in sorted(entry['words'])]
+        line_text = ' '.join(words)
+        line_conf = max(entry['confs']) if entry['confs'] else -1
+        yield line_text, line_conf, entry['box']
 
 
 def redact_plan_image(image_path: str, extra_terms: list = None, pad: int = 6,
@@ -102,7 +145,7 @@ def redact_plan_image(image_path: str, extra_terms: list = None, pad: int = 6,
     draw = ImageDraw.Draw(mask)
 
     hits = []
-    for text, conf, box in _ocr_words(image_path):
+    for text, conf, box in _ocr_lines(image_path):
         if conf < min_conf:
             continue
         if is_blocked_text(text, extra_terms):
