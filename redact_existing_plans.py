@@ -19,6 +19,7 @@ import json
 import shlex
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -177,7 +178,19 @@ def main():
         sys.exit(1)
 
     ssh = SSHClient()
-    ssh._connect()
+    # A one-off socket timeout on the very first connect attempt (observed
+    # live: run 29927231184 failed here, before touching a single image)
+    # otherwise kills the whole run instantly with zero progress made —
+    # retry a couple of times before giving up.
+    for attempt in range(3):
+        try:
+            ssh._connect()
+            break
+        except Exception as e:
+            if attempt == 2:
+                raise
+            log(f"Initial SSH connect failed ({e}), retrying...")
+            time.sleep(5)
 
     log("Fetching plan targets...")
     targets = fetch_plan_targets(ssh, post_ids)
