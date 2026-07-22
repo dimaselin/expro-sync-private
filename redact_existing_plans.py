@@ -43,21 +43,30 @@ except ImportError:
 _HOME_DIR = WP_PATH.split('/domains/')[0]
 BACKUP_DIR = f'{_HOME_DIR}/esm_plan_backups'
 
-PROGRESS_FILE = Path(__file__).parent / 'data' / 'redact_plans_progress.json'
+# Separate files (and separate cache keys in the workflow) for dry-run vs.
+# real writes — a dry-run marks every scanned item 'redacted'/'clean' in its
+# progress file same as a real run does, so sharing one file/cache prefix
+# would make a real run silently restore the dry-run's "everything already
+# done" progress and skip writing anything at all.
+def progress_file(dry_run: bool) -> Path:
+    name = 'redact_plans_progress_dryrun.json' if dry_run else 'redact_plans_progress.json'
+    return Path(__file__).parent / 'data' / name
 
 
-def _load_progress() -> dict:
-    if PROGRESS_FILE.exists():
+def _load_progress(dry_run: bool) -> dict:
+    f = progress_file(dry_run)
+    if f.exists():
         try:
-            return json.loads(PROGRESS_FILE.read_text())
+            return json.loads(f.read_text())
         except Exception:
             pass
     return {}
 
 
-def _save_progress(p: dict):
-    PROGRESS_FILE.parent.mkdir(exist_ok=True)
-    PROGRESS_FILE.write_text(json.dumps(p, indent=2, ensure_ascii=False))
+def _save_progress(p: dict, dry_run: bool):
+    f = progress_file(dry_run)
+    f.parent.mkdir(exist_ok=True)
+    f.write_text(json.dumps(p, indent=2, ensure_ascii=False))
 
 
 def fetch_plan_targets(ssh: SSHClient, post_ids: list = None) -> list:
@@ -159,8 +168,8 @@ def main():
     ap.add_argument("--reset-progress", action="store_true")
     args = ap.parse_args()
 
-    if args.reset_progress and PROGRESS_FILE.exists():
-        PROGRESS_FILE.unlink()
+    if args.reset_progress and progress_file(args.dry_run).exists():
+        progress_file(args.dry_run).unlink()
 
     post_ids = [int(x) for x in args.post_ids.split(",")] if args.post_ids else None
     if not args.all and not post_ids:
@@ -174,7 +183,7 @@ def main():
     targets = fetch_plan_targets(ssh, post_ids)
     log(f"  {len(targets)} property posts with a floor plan.")
 
-    progress = _load_progress() if args.resume else {}
+    progress = _load_progress(args.dry_run) if args.resume else {}
     stats = {'redacted': 0, 'clean': 0, 'error': 0, 'skipped': 0}
 
     for i, t in enumerate(targets, 1):
@@ -201,9 +210,9 @@ def main():
         stats[result] += 1
         progress[pid] = result
         if i % 20 == 0:
-            _save_progress(progress)
+            _save_progress(progress, args.dry_run)
 
-    _save_progress(progress)
+    _save_progress(progress, args.dry_run)
     ssh.close()
     log(f"\nDone. {stats}")
 
