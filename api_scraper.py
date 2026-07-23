@@ -408,18 +408,21 @@ def build_investment(
                 api_inv.get("completion_date_to") or "")
 
     # ── Investment gallery images ────────────────────────────────────────────
-    # /files/photos/ requires an authenticated ExPro session — unlike
-    # /files/files/ (unit plans, public), a plain GET redirects to
-    # /user/login and returns an HTML page instead of the image. Downstream,
-    # `wp media import <remote_url>` runs on the WP server with no ExPro
-    # session at all, so it was downloading that login-redirect HTML and
-    # WordPress correctly refused it ("Brak uprawnienia do przesyłania
-    # plików tego typu" — wrong file type). Confirmed live 2026-07-23:
-    # affected every investment whose gallery import ran after this path
-    # was introduced (Aleja Platanowa 2, Osiedle Nasza Symfonia etap II,
-    # Lokum Porto Finale — 0 gallery images despite real URLs in the data).
-    # Fixed the same way unit plans already were: download with the
-    # authenticated `session` here, upload the local file later.
+    # The old code built URLs as /files/photos/{pic} — wrong path entirely
+    # (real 404 from the backend, not a login redirect). Confirmed live
+    # 2026-07-23 via a Playwright network trace of ExPro's own admin panel
+    # (viewing an investment with photos, /investments/viewdetails/id/{id}):
+    # the real path is /files/investments/{pic}, and it's PUBLIC — no
+    # session needed, same as /files/files/ for unit plans. (There's also an
+    # "h30_{pic}" thumbnail variant the admin UI uses for small previews;
+    # the bare filename is the full-size original, used here.)
+    # This was silently breaking gallery photos for every investment whose
+    # media-import step ran with this code (Aleja Platanowa 2, Osiedle Nasza
+    # Symfonia etap II, Lokum Porto Finale — 0 gallery images despite real
+    # filenames in the data). Still downloaded via `session` (harmless extra
+    # cookie on a public request) and stored locally, mirroring the existing
+    # plan-image pattern, so import_media.py can SFTP-upload + `wp media
+    # import` from the local path instead of a remote URL either way.
     images: list[str] = []
     image_url_map: dict[str, str] = {}
     pics_raw = api_inv.get("pictures") or api_inv.get("picture") or ""
@@ -429,7 +432,7 @@ def build_investment(
         pic = pic.strip()
         if pic and pic not in seen_pics:
             seen_pics.add(pic)
-            img_url = f"{BASE_URL}/files/photos/{pic}"
+            img_url = f"{BASE_URL}/files/investments/{pic}"
             images.append(img_url)
             img_gallery_dir.mkdir(parents=True, exist_ok=True)
             local = img_gallery_dir / pic
