@@ -168,21 +168,53 @@ def check_image_exists(ssh: SSHClient, image_url: str) -> Optional[int]:
     return None
 
 
-def import_image_to_wp(ssh: SSHClient, image_url: str, post_id: int) -> Optional[int]:
-    """Import image URL into WP media library. Returns attachment ID or None."""
+def import_image_to_wp(ssh: SSHClient, image_url: str, post_id: int,
+                        local_path: Optional[str] = None) -> Optional[int]:
+    """Import an image into WP media library. Returns attachment ID or None.
+
+    If `local_path` is given (a file already downloaded with proper auth —
+    see api_scraper.py's image_url_map, needed for /files/photos/ URLs which
+    require an authenticated ExPro session), it's SFTP-uploaded to the
+    server and imported from that local server path instead of `image_url`
+    directly. `wp media import <remote_url>` runs ON the WP server with no
+    ExPro session at all — for an auth-gated URL it downloads the
+    /user/login redirect's HTML instead of the image, and WordPress
+    correctly refuses it as the wrong file type. Confirmed live 2026-07-23
+    against 3 investments (Aleja Platanowa 2, Osiedle Nasza Symfonia etap
+    II, Lokum Porto Finale) that all had 0 gallery images despite real URLs
+    in the ExPro data.
+    """
     # dedup check
     existing = check_image_exists(ssh, image_url)
     if existing:
         return existing
 
     try:
-        wp_args = (
-            f"media import {shlex.quote(image_url)} "
-            f"--post_id={post_id} --porcelain"
-        )
+        if local_path and os.path.exists(local_path):
+            remote_tmp = f"/tmp/esm_gallery_{post_id}_{os.path.basename(local_path)}"
+            sftp = ssh._client.open_sftp()
+            try:
+                sftp.put(local_path, remote_tmp)
+            finally:
+                sftp.close()
+            wp_args = (
+                f"media import {shlex.quote(remote_tmp)} "
+                f"--post_id={post_id} --porcelain"
+            )
+        else:
+            wp_args = (
+                f"media import {shlex.quote(image_url)} "
+                f"--post_id={post_id} --porcelain"
+            )
         out = ssh.run_wp_cli(wp_args, timeout=120)
         att_id = out.strip()
         if att_id.isdigit():
+            if local_path:
+                # wp media import from a local path doesn't set _source_url
+                # (that's normally set by media_sideload_image() when
+                # importing from a URL) — set it explicitly so
+                # check_image_exists() can still dedup on future runs.
+                ssh.run_wp_cli(f"post meta update {att_id} _source_url {shlex.quote(image_url)}")
             return int(att_id)
         log(f"    Image import returned non-ID: {att_id!r}")
     except Exception as e:

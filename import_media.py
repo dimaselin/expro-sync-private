@@ -119,11 +119,12 @@ def import_media_for(ssh: SSHClient, post_id: int, inv: dict, skip_existing: boo
     # which individual units fall back to when they have no gallery of
     # their own (mieszkania_sync.py's "reuse parent thumbnail" path).
     images = [u for u in inv.get('images', []) if 'expander-logo' not in u]
+    image_url_map = inv.get('image_url_map', {})
     if images and (not existing_gallery or not skip_existing):
         log(f'  Importing {len(images)} gallery images…')
         img_ids = []
         for i, url in enumerate(images):
-            aid = import_image_to_wp(ssh, url, post_id)
+            aid = import_image_to_wp(ssh, url, post_id, local_path=image_url_map.get(url))
             if aid:
                 img_ids.append(str(aid))
                 log(f'  [{i + 1}/{len(images)}] → ID {aid}')

@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import datetime
@@ -95,12 +96,23 @@ def make_headers(token: str) -> dict:
     return {"Authorization": f"Bearer: {token}"}
 
 def create_web_session() -> requests.Session:
-    """Login via web form to get session cookie (needed for /files/photos/ downloads)."""
+    """Login via web form to get session cookie (needed for /files/photos/ downloads).
+
+    The login form requires a hidden "nocsrf" anti-CSRF token tied to the
+    GET-rendered form — posting username/password alone (the previous
+    implementation) always failed silently, so this session was NEVER
+    actually authenticated. Confirmed live 2026-07-23: without the token,
+    /user/login redirects right back to itself; with it, it reaches
+    /dashboard and the response contains a logout link.
+    """
     session = requests.Session()
     try:
+        login_page = session.get(f"{BASE_URL}/user/login", timeout=15)
+        m = re.search(r'name=["\']nocsrf["\']\s+value=["\']([^"\']*)["\']', login_page.text, re.I)
+        nocsrf = m.group(1) if m else ""
         resp = session.post(
             f"{BASE_URL}/user/login",
-            data={"username": USERNAME, "password": PASSWORD},
+            data={"username": USERNAME, "password": PASSWORD, "nocsrf": nocsrf, "Login": "ZALOGUJ"},
             allow_redirects=True,
             timeout=15,
         )
@@ -395,15 +407,34 @@ def build_investment(
     delivery = (api_inv.get("completion_date_from") or
                 api_inv.get("completion_date_to") or "")
 
-    # ── Investment gallery images (URLs only; /files/photos/ needs session) ──
+    # ── Investment gallery images ────────────────────────────────────────────
+    # /files/photos/ requires an authenticated ExPro session — unlike
+    # /files/files/ (unit plans, public), a plain GET redirects to
+    # /user/login and returns an HTML page instead of the image. Downstream,
+    # `wp media import <remote_url>` runs on the WP server with no ExPro
+    # session at all, so it was downloading that login-redirect HTML and
+    # WordPress correctly refused it ("Brak uprawnienia do przesyłania
+    # plików tego typu" — wrong file type). Confirmed live 2026-07-23:
+    # affected every investment whose gallery import ran after this path
+    # was introduced (Aleja Platanowa 2, Osiedle Nasza Symfonia etap II,
+    # Lokum Porto Finale — 0 gallery images despite real URLs in the data).
+    # Fixed the same way unit plans already were: download with the
+    # authenticated `session` here, upload the local file later.
     images: list[str] = []
+    image_url_map: dict[str, str] = {}
     pics_raw = api_inv.get("pictures") or api_inv.get("picture") or ""
     seen_pics: set[str] = set()
+    img_gallery_dir = Path(f"data/images/inv_{inv_id}")
     for pic in pics_raw.split(","):
         pic = pic.strip()
         if pic and pic not in seen_pics:
             seen_pics.add(pic)
-            images.append(f"{BASE_URL}/files/photos/{pic}")
+            img_url = f"{BASE_URL}/files/photos/{pic}"
+            images.append(img_url)
+            img_gallery_dir.mkdir(parents=True, exist_ok=True)
+            local = img_gallery_dir / pic
+            if download_image(img_url, local, session=session):
+                image_url_map[img_url] = str(local)
 
     # ── Units ─────────────────────────────────────────────────────────────
     try:
@@ -499,6 +530,7 @@ def build_investment(
         "description":    description,
         "extra":          extra,
         "images":         images,
+        "image_url_map":  image_url_map,
         "contact":        contact,
         "units":          units,
         "documents":      [],          # not in API; wp_sync.py guards with `if documents:`
