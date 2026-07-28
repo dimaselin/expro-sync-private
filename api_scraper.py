@@ -10,7 +10,7 @@ New fields added (bonus):
 Fields unavailable via API (handled gracefully):
   developer_url     → "" (wp_sync.py only writes if non-empty, so WP value preserved)
   documents         → [] (wp_sync.py only writes if non-empty)
-  zasady_wspolpracy → {} (not used downstream)
+  (zasady_wspolpracy IS collected — separate HTML pass, see fill_zasady_concurrent)
   extra.*           → parsed from description text where present; otherwise ""
                       (wp_sync.py has `if value:` guard, so existing WP values preserved)
   per-unit Phase 2  → bedrooms/bathrooms/has_balcony etc. → absent or default
@@ -351,6 +351,87 @@ def parse_description_text(raw: str) -> tuple[dict, dict]:
     return desc, extra
 
 # ---------------------------------------------------------------------------
+# Zasady współpracy (commission terms) — HTML only, absent from the REST API
+# ---------------------------------------------------------------------------
+
+ZASADY_LABELS = {
+    "stawka_standard":    "Stawka standard",
+    "stawka_vip":         "Stawka VIP",
+    "warunki":            "Warunki wynagrodzenia",
+    "garaz_w_prowizji":   "Garaż/komórka wliczana do prowizji",
+    "termin_wyplaty":     "Termin wypłaty prowizji (dni)",
+    "komentarz":          "Komentarz dot. zgłoszeń",
+    "waznosc_zgloszenia": "Ważność zgłoszenia",
+}
+
+def parse_zasady(html: str) -> dict:
+    """Extract the 'Zasady współpracy' block from an investment detail page.
+
+    Labels and values sit in separate tags, so the tag soup is flattened to
+    lines and each label is paired with the first non-label line after it.
+    """
+    start = html.find("Zasady współpracy")
+    if start < 0:
+        return {}
+    seg = re.sub(r"<script.*?</script>", "", html[start:start + 8000], flags=re.S)
+    lines = [l.strip() for l in re.sub(r"<[^>]+>", "\n", seg).split("\n")]
+    lines = [l for l in lines if l]
+    labels = set(ZASADY_LABELS.values())
+    out: dict[str, str] = {}
+    for key, label in ZASADY_LABELS.items():
+        for n, line in enumerate(lines):
+            if line.rstrip(":").strip() != label:
+                continue
+            val = line.split(":", 1)[1].strip() if ":" in line else ""
+            if not val:
+                for nxt in lines[n + 1:n + 4]:
+                    cand = nxt.lstrip(":").strip()
+                    if cand and cand.rstrip(":") not in labels:
+                        val = cand
+                        break
+            if val:
+                out[key] = val
+            break
+    return out
+
+def fetch_zasady(session: requests.Session, inv_id: str) -> dict:
+    url = f"{BASE_URL}/investments/viewdetails/id/{inv_id}/"
+    for _ in range(3):
+        try:
+            resp = session.get(url, timeout=60)
+            if resp.status_code == 200:
+                return parse_zasady(resp.text)
+        except Exception:
+            time.sleep(1)
+    return {}
+
+def fill_zasady_concurrent(session: requests.Session, results: list[dict]) -> int:
+    """Fetch commission terms for every investment and refresh scrape_hash.
+
+    Must run before the JSON is written: scrape_hash() covers
+    zasady_wspolpracy, so a rate change has to flip the hash and trigger a
+    wp_sync update.
+    """
+    filled = 0
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {
+            pool.submit(fetch_zasady, session, inv["expro_id"]): inv
+            for inv in results
+        }
+        for fut in as_completed(futures):
+            inv = futures[fut]
+            try:
+                zasady = fut.result()
+            except Exception as e:
+                log(f"  zasady ERROR ID={inv['expro_id']}: {e}")
+                continue
+            if zasady:
+                inv["zasady_wspolpracy"] = zasady
+                inv["scrape_hash"] = scrape_hash(inv)
+                filled += 1
+    return filled
+
+# ---------------------------------------------------------------------------
 # Hash (same logic as old scraper for change detection)
 # ---------------------------------------------------------------------------
 
@@ -537,7 +618,7 @@ def build_investment(
         "contact":        contact,
         "units":          units,
         "documents":      [],          # not in API; wp_sync.py guards with `if documents:`
-        "zasady_wspolpracy": {},       # not in API (commission terms)
+        "zasady_wspolpracy": {},       # filled by fill_zasady_concurrent() (HTML pass)
         "last_updated_expro": api_inv.get("creation_date", ""),
         # ── Bonus fields (new, not from old scraper) ────────────────────
         "expro_uuid":     inv_uuid,
@@ -636,6 +717,11 @@ def main() -> None:
             log(f"  ERROR: {e}")
         if idx < total:
             time.sleep(DELAY)
+
+    # Commission terms — separate HTML pass, needs the web session
+    log("Fetching zasady współpracy (commission terms) …")
+    filled = fill_zasady_concurrent(session, results)
+    log(f"  commission terms: {filled}/{len(results)} investments")
 
     # Save
     out_path = Path(DATA_FILE)
