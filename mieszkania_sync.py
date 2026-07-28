@@ -234,7 +234,13 @@ foreach ($units as $u) {
     if ($city) $content .= ", {$city}";
     if ($street) $content .= ", ul. {$street}";
     $content .= ".";
-    if ($delivery) $content .= " Termin oddania: {$delivery}.";
+    // A completion date already in the past reads as an abandoned listing.
+    if ($delivery) {
+        $d_ts = strtotime($delivery);
+        $content .= ($d_ts && $d_ts < strtotime('today'))
+            ? " Gotowe do odbioru."
+            : " Termin oddania: {$delivery}.";
+    }
     if ($price) {
         $price_fmt = number_format((int)$price, 0, ',', ' ');
         $content .= " Cena: {$price_fmt} PLN";
