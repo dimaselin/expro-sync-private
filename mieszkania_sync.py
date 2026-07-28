@@ -40,14 +40,17 @@ def _dom_only_ids() -> set:
 # ── Taxonomy term IDs (verified on site) ─────────────────────────────────────
 LABEL_RYNEK_PIERWOTNY = 181   # property_label: Rynek Pierwotny
 
+# Unused by the sync itself (the PHP template carries its own copy) but kept in
+# step with it so the two never disagree.
 STATUS_SLUG_MAP = {
-    'dostępne':      'wolny',
-    'dostepne':      'wolny',
-    'wolne':         'wolny',
-    'zarezerwowane': 'zarezerwowany',
-    'rezerwacja':    'zarezerwowany',
-    'sprzedane':     'sprzedany',
-    'sprzedany':     'sprzedany',
+    'dostępne':          'wolny',
+    'dostepne':          'wolny',
+    'wolne':             'wolny',
+    'zarezerwowane':     'zarezerwowany',
+    'rezerwacja':        'zarezerwowany',
+    'rezerwacja ustna':  'zarezerwowany',
+    'sprzedane':         'sprzedany',
+    'sprzedany':         'sprzedany',
 }
 
 TYPE_SLUG_MAP = {
@@ -82,6 +85,10 @@ $status_map = [
     'wolne'         => 'wolny',
     'zarezerwowane' => 'zarezerwowany',
     'rezerwacja'    => 'zarezerwowany',
+    // ExPro also emits "Rezerwacja ustna" (41 units in the current feed). It
+    // was missing from this map, so those units fell through to the 'wolny'
+    // default and were advertised as free.
+    'rezerwacja ustna' => 'zarezerwowany',
     'sprzedane'     => 'sprzedany',
     'sprzedany'     => 'sprzedany',
 ];
@@ -153,16 +160,16 @@ foreach ($units as $u) {
     // ── Rooms ────────────────────────────────────────────────────────────
     $rooms = (string)($u['rooms'] ?? $u['Pokoje'] ?? '');
 
-    // ── Bedrooms (sypialnie = pokoje - 1, min 1) ─────────────────────────
-    $bedrooms_raw = (string)($u['bedrooms'] ?? '');
-    if ($bedrooms_raw !== '') {
-        $bedrooms = $bedrooms_raw;
-    } else {
-        $bedrooms = (string)max((int)$rooms - 1, 1);
-    }
+    // ── Bedrooms ─────────────────────────────────────────────────────────
+    // Was "pokoje - 1, min 1" whenever ExPro sent nothing, which is always —
+    // the unit payload has no bedrooms field. A guess written into the database
+    // reads exactly like a measurement, so an empty value stays empty.
+    $bedrooms = (string)($u['bedrooms'] ?? '');
 
     // ── Bathrooms ────────────────────────────────────────────────────────
-    $bathrooms = (string)($u['bathrooms'] ?? '1');
+    // Was hardcoded to '1' for every unit; ExPro has no bathrooms field at all,
+    // so all 7015 units claimed one bathroom nobody had counted.
+    $bathrooms = (string)($u['bathrooms'] ?? '');
 
     // ── Garage ───────────────────────────────────────────────────────────
     $garage = ($u['has_garage'] ?? false) ? 'Tak' : '';
@@ -217,7 +224,9 @@ foreach ($units as $u) {
     $rooms_txt = $rooms ? $rooms . '-pokojowe' : '';
     $content = "{$typ_label}";
     if ($rooms_txt) $content .= " {$rooms_txt}";
-    if ($area) $content .= " o powierzchni {$area} m²";
+    // Polish decimal comma, matching every other number on the page. The raw
+    // value carries a dot ("99.88"), which the rendered page never uses.
+    if ($area) { $area_txt = str_replace('.', ',', (string)$area); $content .= " o powierzchni {$area_txt} m²"; }
     if ($floor_disp && in_array($type_slug, ['mieszkanie', 'lokal-uzytkowy'])) {
         $content .= ", {$floor_disp}";
     }
@@ -229,10 +238,14 @@ foreach ($units as $u) {
     if ($price) {
         $price_fmt = number_format((int)$price, 0, ',', ' ');
         $content .= " Cena: {$price_fmt} PLN";
-        if ($price_m2) $content .= " ({$price_m2} PLN/m²)";
+        // Was printed raw ("15008 PLN/m²") while the same figure appeared as
+        // "15 008" everywhere else on the page.
+        if ($price_m2) { $pm2_fmt = number_format((int)$price_m2, 0, ',', ' '); $content .= " ({$pm2_fmt} PLN/m²)"; }
         $content .= ".";
     }
-    if ($etap) $content .= " Etap: {$etap}.";
+    // "b/d" is ExPro's "no data", not a stage — it went into the description
+    // verbatim on 5642 of 7015 units as "Etap: b/d.".
+    if ($etap && strcasecmp(trim($etap), 'b/d') !== 0) $content .= " Etap: {$etap}.";
 
     // Investment amenities in description
     $amenity_lines = [];
@@ -321,6 +334,11 @@ foreach ($units as $u) {
         'inw_smart_home'              => $inv_extra['smart_home'] ?? '',
         'inw_stacja_ev'               => $inv_extra['stacja_ev'] ?? '',
         'inw_ochrona'                 => $inv_extra['rodzaje_ochrony'] ?? '',
+        // Real building height. The unit template used to draw its floor tower
+        // from max($floor_nr + 3, 8) — an invented block — because this never
+        // reached the unit. ExPro fills it on 157 of 173 investments.
+        'inw_pietro_max'              => $inv_extra['pietro_max'] ?? '',
+        'inw_wielkosc_projektu'       => $inv_extra['wielkosc_projektu'] ?? '',
     ];
     foreach ($metas as $k => $v) {
         update_post_meta($post_id, $k, (string)$v);
