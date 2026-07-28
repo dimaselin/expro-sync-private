@@ -147,19 +147,20 @@ def part_features(ssh: SSHClient, apply: bool) -> None:
     log("── part: features ─────────────────────────────────────────")
     php = r"""<?php
 global $wpdb;
-// investment expro_id -> the six amenity answers
+// investment expro_id -> every answer any post carrying that expro_id holds.
+// Five expro_ids have two inwestycja posts (a stale draft beside the published
+// one) and the two disagree: Legnicka Vita's published post has an empty
+// expro_smart_home while its draft still holds 'Nie'. Keying by expro_id and
+// letting the last post win read that as "no data" and left 79 units tagged.
+// Collect all of them and let the caller resolve.
 $out = ['inv' => [], 'units' => []];
 foreach (get_posts(['post_type'=>'inwestycja','post_status'=>'any','posts_per_page'=>-1,'fields'=>'ids']) as $iid) {
     $eid = get_post_meta($iid, 'expro_id', true);
     if (!$eid) continue;
-    $out['inv'][$eid] = [
-        'expro_winda'      => (string) get_post_meta($iid,'expro_winda',true),
-        'expro_smart_home' => (string) get_post_meta($iid,'expro_smart_home',true),
-        'expro_stacja_ev'  => (string) get_post_meta($iid,'expro_stacja_ev',true),
-        'expro_parking'    => (string) get_post_meta($iid,'expro_parking',true),
-        'expro_komorki'    => (string) get_post_meta($iid,'expro_komorki',true),
-        'expro_pod_klucz'  => (string) get_post_meta($iid,'expro_pod_klucz',true),
-    ];
+    foreach (['expro_winda','expro_smart_home','expro_stacja_ev',
+              'expro_parking','expro_komorki','expro_pod_klucz'] as $k) {
+        $out['inv'][$eid][$k][] = (string) get_post_meta($iid, $k, true);
+    }
 }
 // every published property with its expro_id and its property_feature terms
 $rows = $wpdb->get_results("
@@ -186,11 +187,14 @@ echo json_encode($out, JSON_UNESCAPED_UNICODE);
         src = FEATURE_SOURCES.get(feat)
         if not src:
             continue                       # unit-level amenity or manual term — never touched
-        val = (inv.get(r["eid"], {}) or {}).get(src, "")
-        if val == "":
+        vals = [v for v in (inv.get(r["eid"], {}) or {}).get(src, []) if v != ""]
+        if not vals:
             no_evidence[feat] = no_evidence.get(feat, 0) + 1
-            continue                       # no data either way — leave it alone
-        if is_yes(val):
+            continue                       # no data on any post — leave it alone
+        # A single yes anywhere wins: the feature exists and one of the posts
+        # has simply lost the value. Only remove when every answer we have is
+        # a no.
+        if any(is_yes(v) for v in vals):
             kept_yes[feat] = kept_yes.get(feat, 0) + 1
             continue
         to_remove.setdefault(feat, []).append({"post_id": int(r["ID"]), "ttid": int(r["ttid"])})
