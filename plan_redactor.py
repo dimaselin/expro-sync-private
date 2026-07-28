@@ -46,7 +46,18 @@ _PHONE_DIGITS_RE = re.compile(r'^\d[\d\s.\-oO]{6,}\d$')  # tolerate OCR 0/O conf
 _DATE_RE = re.compile(r'^\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}$')
 _KEYWORDS = [
     'biuro sprzedaży', 'biuro sprzedazy', 'dział sprzedaży', 'dzial sprzedazy',
+    # Lokum's plans label the block "Salon Sprzedaży", which none of the
+    # variants above matched — its address and phone stayed in the clear.
+    'salon sprzedaży', 'salon sprzedazy',
     'sprzedaż mieszkań', 'sprzedaz mieszkan', 'sprzedaz@', 'ul.', 'www.',
+]
+
+# Keywords that make a line a contact/sales-office line in its own right, as
+# opposed to a legal sentence that merely ends with a developer's domain. Lines
+# carrying one of these are blurred whole, however long they are.
+_CONTACT_KEYWORDS = [
+    'biuro sprzedaży', 'biuro sprzedazy', 'dział sprzedaży', 'dzial sprzedazy',
+    'salon sprzedaży', 'salon sprzedazy', 'sprzedaż mieszkań', 'sprzedaz mieszkan',
 ]
 
 # Generic Polish real-estate/floor-plan vocabulary that legitimately recurs in
@@ -58,7 +69,10 @@ _KEYWORDS = [
 # get wrongly blurred just because they share the word "mieszkania".
 _GENERIC_WORDS = {
     'mieszkanie', 'mieszkania', 'mieszkań', 'mieszkaniu', 'mieszkaniem',
-    'dom', 'domu', 'domy', 'domów', 'lokal', 'lokalu', 'lokum',
+    # "lokum" was here as a common noun for "dwelling", but it is also a
+    # developer's brand — and floor plans do not label rooms with it, so the
+    # only thing the exclusion protected was the developer's own name.
+    'dom', 'domu', 'domy', 'domów', 'lokal', 'lokalu',
     'budynek', 'budynku', 'budynki', 'inwestycja', 'inwestycji',
     'parking', 'piwnica', 'piwnicy', 'balkon', 'balkonu', 'taras', 'tarasu',
     'strefa', 'strefy', 'klatka', 'klatki', 'schodowa', 'winda', 'windy',
@@ -82,6 +96,8 @@ def is_blocked_text(text: str, extra_terms: list) -> bool:
         return True
     if _PHONE_KEYWORD_RE.search(tl):
         return True
+    if has_phone_number(t):
+        return True
     # Phone-digit heuristic only for short, mostly-numeric tokens — a real
     # phone number OCRs as its own short token; long sentences that merely
     # contain a date or a regulation/article number (common in the legal
@@ -91,9 +107,14 @@ def is_blocked_text(text: str, extra_terms: list) -> bool:
     # "0 100 200cm", and a plain revision-date stamp ("15.06.2026") is
     # excluded explicitly — it looks identical in shape to a phone number
     # but isn't developer/investment-identifying info.
+    # A dimension chain along a wall ("463 662 816 123") OCRs as one line and
+    # satisfies this shape exactly — same digits, same separators, same length
+    # bracket as a phone. Requiring a context marker is what separates the two;
+    # without it this rule blurred part of the drawing.
     digits_only = re.sub(r'\D', '', t)
     if (len(t) <= 20 and not _DATE_RE.match(t)
-            and _PHONE_DIGITS_RE.match(t) and len(digits_only) >= 7):
+            and _PHONE_DIGITS_RE.match(t) and len(digits_only) >= 7
+            and _PHONE_CONTEXT_RE.search(t)):
         return True
     for kw in _KEYWORDS:
         if kw in tl:
@@ -137,6 +158,61 @@ def is_blocked_text(text: str, extra_terms: list) -> bool:
 def _self_complete_hit(word_text: str) -> bool:
     t = word_text.strip()
     return bool(t) and bool(_EMAIL_RE.search(t) or _DOMAIN_RE.search(t) or _POSTAL_RE.search(t))
+
+
+# A phone is only recognised next to something that announces one. Floor plans
+# are covered in bare numbers — a wall's dimension chain OCRs as a single line
+# like "463 662 816 123", which joins to 12 digits and is indistinguishable
+# from a phone by shape alone. Blurring that would eat the drawing, so a
+# context marker is required and the digit count is capped.
+_PHONE_CONTEXT_RE = re.compile(r'\b(tel|telefon|kom|fax|faks|mob)\b\.?:?|\+\s?48', re.I)
+
+
+def has_phone_number(text: str) -> bool:
+    """True if the line contains something shaped like a phone number.
+
+    _PHONE_DIGITS_RE only ever sees one token at a time, and Tesseract splits
+    "tel. 71 796 66 66" into four short tokens, none of which reaches the
+    seven-digit floor — so a printed sales-office phone looked like four
+    harmless numbers and survived redaction. Adjacent numeric tokens are
+    joined here before the length test, which is how a human reads them.
+    """
+    if not _PHONE_CONTEXT_RE.search(text):
+        return False
+    tokens = text.split()
+    run = []
+    for tok in tokens + ['']:
+        cleaned = tok.strip('.,;:()')
+        is_num = bool(cleaned) and bool(re.fullmatch(r'[+()\d\s.\-oO]+', cleaned)) \
+            and any(ch.isdigit() for ch in cleaned)
+        if is_num and not _DATE_RE.match(cleaned):
+            run.append(cleaned)
+            continue
+        if run:
+            digits = re.sub(r'\D', '', ''.join(run))
+            # 9 digits is a full Polish number, 11 with the country code. Longer
+            # runs are dimension chains, not numbers anyone can dial.
+            if 9 <= len(digits) <= 12:
+                return True
+            run = []
+    return False
+
+
+# Signals that make a line a contact/identity line on its own, regardless of
+# how long it is. A long legal disclaimer that merely ends in a developer
+# domain is NOT one of these — that distinction is the whole point of
+# _LONG_LINE_CHARS, and it stays intact for the weak signals.
+def contact_signal(text: str) -> bool:
+    tl = text.lower()
+    if _EMAIL_RE.search(text):
+        return True
+    if _POSTAL_RE.search(text):
+        return True
+    if _PHONE_KEYWORD_RE.search(tl) and has_phone_number(text):
+        return True
+    if has_phone_number(text):
+        return True
+    return any(kw in tl for kw in _CONTACT_KEYWORDS)
 
 
 # Above this line length, a match is assumed to be a long legal-disclaimer
@@ -215,7 +291,12 @@ def redact_plan_image(image_path: str, extra_terms: list = None, pad: int = 6,
             continue
         target_box = box
         target_text = text
-        if len(text) > _LONG_LINE_CHARS:
+        # A line carrying a real contact signal is a contact line no matter how
+        # long it is. Without this, a wrapped sales-office block ("Salon
+        # Sprzedaży: <address>, tel. 71 796 66 66, e-mail: ...") fell into the
+        # long-line branch below, which blurred only the e-mail token and left
+        # the address and phone readable — exactly what was found live.
+        if len(text) > _LONG_LINE_CHARS and not contact_signal(text):
             self_hits = [(w, b) for w, b in words if _self_complete_hit(w)]
             if self_hits:
                 xs0 = min(b[0] for _, b in self_hits)
