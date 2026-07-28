@@ -355,22 +355,39 @@ def derive_rooms(inv: dict) -> str:
 
 
 def derive_price_m2(inv: dict) -> str:
-    """Calculate average price per m² from units (Cena m2 / price_m2_raw)."""
+    """Average price per m² across the units (Cena m2 / price_m2_raw).
+
+    The pattern used to require a trailing "PLN", which the Playwright scraper
+    emitted ("15 008,00 PLN") but the API scraper does not — it writes the bare
+    integer "15008". So this matched 0 of 7015 units and returned "" every run;
+    because the caller only writes truthy values, projekt_cena_za_m2 kept
+    whatever the old scraper had left behind and has been frozen since the
+    migration. The number is now read with or without the currency, and ExPro's
+    own investment-level figure is the fallback when no unit carries one.
+    """
     units = inv.get("units", [])
     vals: list[float] = []
     for u in units:
         raw = _uval(u, "Cena m2", "price_m2_raw")
-        m = re.search(r"(\d[\d\s]*(?:[,.]\d+)?)\s*PLN", raw)
+        m = re.search(r"\d[\d\s]*(?:[,.]\d+)?", raw)
         if m:
             try:
-                num = re.sub(r"\s", "", m.group(1)).replace(",", ".")
-                vals.append(float(num))
+                num = re.sub(r"\s", "", m.group(0)).replace(",", ".")
+                val = float(num)
+                if val > 0:
+                    vals.append(val)
             except ValueError:
                 pass
-    if not vals:
-        return ""
-    avg = round(sum(vals) / len(vals))
-    return str(avg)
+    if vals:
+        return str(round(sum(vals) / len(vals)))
+
+    fallback = inv.get("price_m2_from")
+    try:
+        if fallback and float(fallback) > 0:
+            return str(round(float(fallback)))
+    except (TypeError, ValueError):
+        pass
+    return ""
 
 
 def komisja_rate(inv: dict, key: str) -> str:

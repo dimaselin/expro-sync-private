@@ -66,6 +66,18 @@ DELAY = 0.05
 # Logging
 # ---------------------------------------------------------------------------
 
+def _s(v: object) -> str:
+    """Stringify an API value without turning a missing one into the word "None".
+
+    ExPro sends JSON null for fields it has no value for, and `str(None)` is the
+    four-character string "None" — which is exactly what reached the database:
+    531 property posts carry fave_property_rooms="None" and 515 carry
+    lokal_pietro="None", rendered verbatim on the unit card. A value ExPro
+    doesn't have has to read as absent, not as a room count.
+    """
+    return "" if v is None else str(v).strip()
+
+
 def ts() -> str:
     return datetime.datetime.now().strftime("%H:%M:%S")
 
@@ -504,13 +516,24 @@ def build_investment(
     # cookie on a public request) and stored locally, mirroring the existing
     # plan-image pattern, so import_media.py can SFTP-upload + `wp media
     # import` from the local path instead of a remote URL either way.
+    #
+    # `picture` is the one the developer designated as the main shot, and it is
+    # a separate field from `pictures`; taking pictures[0] as the featured image
+    # picks a different photo on 64 of 170 investments. Put `picture` first so
+    # the thumbnail is the intended one. This does not retroactively fix those
+    # 64: import_media.py skips any post that already has projekt_galeria, and
+    # wp_sync only reaches its image block when scrape_hash changed — and the
+    # hash does not cover photos. They need a one-off re-order pass.
     images: list[str] = []
     image_url_map: dict[str, str] = {}
     pics_raw = api_inv.get("pictures") or api_inv.get("picture") or ""
+    main_pic = (api_inv.get("picture") or "").strip()
+    pic_names = [p.strip() for p in pics_raw.split(",") if p.strip()]
+    if main_pic:
+        pic_names = [main_pic] + [p for p in pic_names if p != main_pic]
     seen_pics: set[str] = set()
     img_gallery_dir = Path(f"data/images/inv_{inv_id}")
-    for pic in pics_raw.split(","):
-        pic = pic.strip()
+    for pic in pic_names:
         if pic and pic not in seen_pics:
             seen_pics.add(pic)
             img_url = f"{BASE_URL}/files/investments/{pic}"
@@ -565,16 +588,16 @@ def build_investment(
             card_urls.append(f"{BASE_URL}{card_path}")
 
         unit: dict = {
-            "name":         ru.get("name", ""),
+            "name":         _s(ru.get("name")),
             "status":       status,
-            "stage":        detail.get("stage", ""),
+            "stage":        _s(detail.get("stage")),
             "price_raw":    str(int(float(ru["price"]))) if ru.get("price") else "",
             "price_m2_raw": str(int(float(ru["pricemkw"]))) if ru.get("pricemkw") else "",
-            "area_raw":     str(ru.get("area", "")),
-            "rooms":        str(ru.get("rooms", "")),
-            "floor":        str(ru.get("floor", "")),
-            "delivery":     detail.get("completion_date", "") or delivery,
-            "type":         detail.get("type_name", ""),
+            "area_raw":     _s(ru.get("area")),
+            "rooms":        _s(ru.get("rooms")),
+            "floor":        _s(ru.get("floor")),
+            "delivery":     _s(detail.get("completion_date")) or delivery,
+            "type":         _s(detail.get("type_name")),
             # realestate_id is now UUID — mieszkania_sync.py handles the migration
             "realestate_id": uid,
             "plan_urls":     plan_urls,
@@ -626,6 +649,11 @@ def build_investment(
         "latitude":       api_inv.get("latitude", ""),
         "longitude":      api_inv.get("longitude", ""),
         "price_to":       price_to_f,
+        # ExPro's own price-per-m² range. wp_sync derives the figure it shows
+        # from the unit rows; this is the fallback for investments whose units
+        # carry no per-m² price of their own.
+        "price_m2_from":  safe_float(api_inv.get("pricemkw_from")),
+        "price_m2_to":    safe_float(api_inv.get("pricemkw_to")),
         "rooms_from":     api_inv.get("rooms_from", ""),
         "rooms_to":       api_inv.get("rooms_to", ""),
         "building_type_id": api_inv.get("building_type_id", ""),

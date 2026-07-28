@@ -128,6 +128,23 @@ if (!function_exists('esm_stat')) {
         return null;
     }
 }
+// ExPro answers the amenity questions with the words "Tak" and "Nie", so
+// !empty() reads "Nie" as a yes. On the live site that put 'Smart Home' on
+// 3634 units whose investment says Nie, and 'Wykończenie pod klucz' on 4523 —
+// while all 163 investments say Nie, so not one of them has it. The tags are
+// only refreshed when the extra block carries data, which it stopped doing
+// after the REST migration, so this has to be correct BEFORE the HTML parser
+// starts filling those fields again.
+if (!function_exists('esm_is_yes')) {
+    function esm_is_yes($v) {
+        $v = trim(mb_strtolower((string) $v));
+        if ($v === '') return false;
+        // Explicit negatives. Anything else non-empty counts as a yes, so a
+        // developer writing "2 windy" or "garaż podziemny" is not thrown away.
+        $no = ['nie', 'no', 'brak', 'nie dotyczy', 'n/d', 'nd', '-', '—', '0', 'false'];
+        return !in_array($v, $no, true);
+    }
+}
 if (!function_exists('esm_put')) {
     function esm_put($post_id, $key, $val) {
         static $clearable = [
@@ -278,6 +295,15 @@ foreach ($units as $u) {
     $address = trim(($street ? $street . ', ' : '') . $city);
     $lat     = (string)($inv['latitude'] ?? $inv['lat'] ?? '');
     $lng     = (string)($inv['longitude'] ?? $inv['lng'] ?? '');
+    // Houzez keeps the pair in ONE field, comma separated, and its own
+    // save_property_post_type() hook re-derives houzez_geolocation_lat/long
+    // from it after every meta write:
+    //     $p = explode(',', get_post_meta($id,'fave_property_location',true));
+    //     update_post_meta($id,'houzez_geolocation_long', $p[1]);
+    // We were writing the bare latitude into that field, so $p[1] did not
+    // exist and the hook overwrote the longitude with NULL a moment after we
+    // set it — the maps stayed blank even once the coordinates arrived.
+    $lat_lng = ($lat !== '' && $lng !== '') ? $lat . ',' . $lng : '';
 
     // ── Description (generated from available data) ───────────────────────
     $rooms_txt = $rooms ? $rooms . '-pokojowe' : '';
@@ -314,11 +340,11 @@ foreach ($units as $u) {
 
     // Investment amenities in description
     $amenity_lines = [];
-    if (!empty($inv_extra['winda'])) $amenity_lines[] = "winda";
-    if (!empty($inv_extra['smart_home'])) $amenity_lines[] = "Smart Home";
-    if (!empty($inv_extra['stacja_ev'])) $amenity_lines[] = "stacja ładowania EV";
-    if (!empty($inv_extra['miejsce_postojowe'])) $amenity_lines[] = "miejsce postojowe";
-    if (!empty($inv_extra['komorki_lokatorskie'])) $amenity_lines[] = "komórka lokatorska";
+    if (esm_is_yes($inv_extra['winda'] ?? ''))               $amenity_lines[] = "winda";
+    if (esm_is_yes($inv_extra['smart_home'] ?? ''))          $amenity_lines[] = "Smart Home";
+    if (esm_is_yes($inv_extra['stacja_ev'] ?? ''))           $amenity_lines[] = "stacja ładowania EV";
+    if (esm_is_yes($inv_extra['miejsce_postojowe'] ?? ''))   $amenity_lines[] = "miejsce postojowe";
+    if (esm_is_yes($inv_extra['komorki_lokatorskie'] ?? '')) $amenity_lines[] = "komórka lokatorska";
     if ($amenity_lines) {
         $content .= " Inwestycja wyposażona m.in. w: " . implode(', ', $amenity_lines) . ".";
     }
@@ -370,7 +396,7 @@ foreach ($units as $u) {
         'fave_property_bathrooms'     => $bathrooms,
         'fave_property_garage'        => $garage,
         'fave_land_area'              => $u['garden_area'] ?? '',
-        'fave_property_location'      => $lat,
+        'fave_property_location'      => $lat_lng,
         'fave_property_location2'     => $lng,
         'houzez_geolocation_lat'      => $lat,
         'houzez_geolocation_long'     => $lng,
@@ -459,12 +485,12 @@ foreach ($units as $u) {
     }
 
     // Investment-level features — always refresh from current inv_extra
-    if (!empty($inv_extra['winda']))               $features[] = 'Winda';
-    if (!empty($inv_extra['smart_home']))           $features[] = 'Smart Home';
-    if (!empty($inv_extra['stacja_ev']))            $features[] = 'Stacja EV';
-    if (!empty($inv_extra['miejsce_postojowe']))    $features[] = 'Miejsce postojowe';
-    if (!empty($inv_extra['komorki_lokatorskie'])) $features[] = 'Komórka lokatorska';
-    if (!empty($inv_extra['pod_klucz']))            $features[] = 'Wykończenie pod klucz';
+    if (esm_is_yes($inv_extra['winda'] ?? ''))               $features[] = 'Winda';
+    if (esm_is_yes($inv_extra['smart_home'] ?? ''))          $features[] = 'Smart Home';
+    if (esm_is_yes($inv_extra['stacja_ev'] ?? ''))           $features[] = 'Stacja EV';
+    if (esm_is_yes($inv_extra['miejsce_postojowe'] ?? ''))   $features[] = 'Miejsce postojowe';
+    if (esm_is_yes($inv_extra['komorki_lokatorskie'] ?? '')) $features[] = 'Komórka lokatorska';
+    if (esm_is_yes($inv_extra['pod_klucz'] ?? ''))           $features[] = 'Wykończenie pod klucz';
 
     if ($features) {
         $features   = array_unique($features);
@@ -678,17 +704,28 @@ def sync_units(ssh: SSHClient, inv: dict, parent_id: int, projekt_term_id: int) 
     if not units:
         return 0, 0
 
+    # The scraper stores coordinates as latitude/longitude; this payload only
+    # ever carried 'lat'/'lng', keys that exist nowhere in its output. The PHP
+    # reads `$inv['latitude'] ?? $inv['lat']`, found neither, and wrote "" —
+    # which is why fave_property_location and houzez_geolocation_lat/long are
+    # empty on all 4917 property posts and no unit shows on a map. Both spellings
+    # go through now, so the PHP finds them whichever key it reaches for.
+    lat = str(inv.get('latitude') or inv.get('lat') or '').strip()
+    lng = str(inv.get('longitude') or inv.get('lng') or '').strip()
+
     payload = {
         'units': units,
         'inv': {
-            'name':     inv.get('name', ''),
-            'expro_id': str(inv.get('expro_id') or inv.get('id', '')),
-            'city':     inv.get('city', ''),
-            'street':   inv.get('street', ''),
-            'district': inv.get('district', ''),
-            'lat':      str(inv.get('lat', '')),
-            'lng':      str(inv.get('lng', '')),
-            'delivery': inv.get('delivery', ''),
+            'name':      inv.get('name', ''),
+            'expro_id':  str(inv.get('expro_id') or inv.get('id', '')),
+            'city':      inv.get('city', ''),
+            'street':    inv.get('street', ''),
+            'district':  inv.get('district', ''),
+            'latitude':  lat,
+            'longitude': lng,
+            'lat':       lat,
+            'lng':       lng,
+            'delivery':  inv.get('delivery', ''),
         },
         'inv_extra':       inv.get('extra', {}),
         'parent_id':       parent_id,
