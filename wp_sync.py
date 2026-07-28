@@ -373,6 +373,19 @@ def derive_price_m2(inv: dict) -> str:
     return str(avg)
 
 
+def komisja_rate(inv: dict, key: str) -> str:
+    """Pull one numeric value out of zasady_wspolpracy as a bare decimal string.
+
+    ExPro stores rates as "2.10" / "1,4" and terms as "14" or "14 dni";
+    the flat meta fields have to be plain numbers to be sortable in WP.
+    """
+    raw = (inv.get("zasady_wspolpracy") or {}).get(key, "")
+    m = re.search(r"\d+(?:[.,]\d+)?", str(raw).replace(",", "."))
+    if not m:
+        return ""
+    return str(float(m.group())).rstrip("0").rstrip(".")
+
+
 def map_status(inv: dict) -> str:
     available = inv.get("units_available", 0)
     if available > 0:
@@ -690,11 +703,23 @@ def sync_investment(ssh: SSHClient, inv: dict) -> Tuple[str, Optional[int]]:
             # standard & odleglosci
             ("projekt_standard",      desc.get("przynaleznosci", "")),
             ("projekt_odleglosci",    desc.get("odleglosc_centrum", "")),
-            # coordinates (filled later by geocoding phase)
-            ("projekt_lat",           str(inv.get("lat", ""))),
-            ("projekt_lng",           str(inv.get("lng", ""))),
+            # Coordinates come straight from ExPro (api_scraper stores them as
+            # "latitude"/"longitude"). This used to read inv["lat"]/["lng"] — keys
+            # that never exist — so it always wrote "" and, because the loop below
+            # only writes truthy values, projekt_lat was left to a separate
+            # geocoding phase that resolved the *street* (no house number) and gave
+            # every address on a street one shared centroid (e.g. all "Krakowska"
+            # investments landed 1.2 km off). ExPro's own lat/lng are per-building
+            # and correct, so use them directly.
+            ("projekt_lat",           str(inv.get("latitude", "")).strip()),
+            ("projekt_lng",           str(inv.get("longitude", "")).strip()),
             # commission terms from ExPro "Zasady współpracy"
             ("projekt_komisja",       json.dumps(inv.get("zasady_wspolpracy", {}), ensure_ascii=False) if inv.get("zasady_wspolpracy") else ""),
+            # …plus the rates as flat, queryable meta (the JSON blob above is not sortable)
+            ("projekt_prowizja_standard",   komisja_rate(inv, "stawka_standard")),
+            ("projekt_prowizja_vip",        komisja_rate(inv, "stawka_vip")),
+            ("projekt_prowizja_termin_dni", komisja_rate(inv, "termin_wyplaty")),
+            ("projekt_prowizja_garaz",      (inv.get("zasady_wspolpracy") or {}).get("garaz_w_prowizji", "")),
         ]
 
         for key, value in meta_fields:

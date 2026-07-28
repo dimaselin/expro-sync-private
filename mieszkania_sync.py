@@ -210,8 +210,8 @@ foreach ($units as $u) {
     $street  = $inv['street'] ?? '';
     $city    = $inv['city']   ?? '';
     $address = trim(($street ? $street . ', ' : '') . $city);
-    $lat     = (string)($inv['lat'] ?? '');
-    $lng     = (string)($inv['lng'] ?? '');
+    $lat     = (string)($inv['latitude'] ?? $inv['lat'] ?? '');
+    $lng     = (string)($inv['longitude'] ?? $inv['lng'] ?? '');
 
     // ── Description (generated from available data) ───────────────────────
     $rooms_txt = $rooms ? $rooms . '-pokojowe' : '';
