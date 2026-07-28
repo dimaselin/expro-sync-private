@@ -15,8 +15,14 @@ from wp_sync import SSHClient, log
 
 try:
     from plan_redactor import redact_plan_image
-except ImportError:
-    redact_plan_image = None  # tesseract/pytesseract not installed — skip redaction gracefully
+except (ImportError, SystemExit):
+    # plan_redactor is a runnable script too, so it reports a missing OCR stack
+    # with sys.exit(1) rather than by raising — and SystemExit is not an
+    # ImportError, so catching only ImportError killed this whole sync outright
+    # instead of skipping redaction. A missing optional dependency must never
+    # stop units from syncing; upload_unit_images() then skips the plan upload
+    # (see there for why they are not published unredacted).
+    redact_plan_image = None
 
 DATA         = Path(__file__).parent / 'data' / 'expro_data.json'
 AMENITY_DATA = Path(__file__).parent / 'data' / 'amenity_data.json'
@@ -98,6 +104,59 @@ if (!function_exists('media_sideload_image')) {
     require_once ABSPATH . 'wp-admin/includes/media.php';
     require_once ABSPATH . 'wp-admin/includes/file.php';
     require_once ABSPATH . 'wp-admin/includes/image.php';
+}
+
+// ── Meta writer ───────────────────────────────────────────────────────────
+// Every meta below used to be written unconditionally, so a field ExPro
+// didn't send this run became an empty string and erased whatever was
+// already in WP. That is not a hypothetical: a dropped unit-detail response,
+// an investment whose `extra` block is empty, or amenity data that only
+// arrives from the weekly Playwright pass all produce "" here, and the value
+// was wiped on every daily run. `fave_land_area`, `lokal_balkon_m2`,
+// `lokal_taras_m2`, the whole `inw_*` family and both geolocation fields
+// were being cleared this way.
+//
+// Empty now means "ExPro said nothing", which is not the same as "ExPro said
+// there is nothing" — so the existing value stays. The only exceptions are
+// the fields listed in $clearable, where a value disappearing is itself the
+// news and a stale number would be worse than none.
+if (!function_exists('esm_stat')) {
+    function esm_stat($key = null) {
+        static $s = ['cleared' => 0, 'kept' => 0];
+        if ($key === null) return $s;
+        $s[$key]++;
+        return null;
+    }
+}
+if (!function_exists('esm_put')) {
+    function esm_put($post_id, $key, $val) {
+        static $clearable = [
+            // Price vanishing from the feed is a real state change; keeping the
+            // old figure would advertise a price that no longer exists.
+            'fave_property_price',
+            'lokal_cena_m2',
+            // Always present in the feed (the reader defaults it), listed so an
+            // empty one is never silently kept.
+            'lokal_status_expro',
+            // Deliberately empty: ExPro has no bedroom/bathroom count and a
+            // guess reads exactly like a measurement. Must stay clearable so an
+            // invented value can never survive here again.
+            'fave_property_bedrooms',
+            'fave_property_bathrooms',
+        ];
+        $val      = (string) $val;
+        $existing = (string) get_post_meta($post_id, $key, true);
+        if ($val !== '') {
+            update_post_meta($post_id, $key, $val);
+            return;
+        }
+        if (in_array($key, $clearable, true)) {
+            if ($existing !== '') esm_stat('cleared');
+            update_post_meta($post_id, $key, '');
+            return;
+        }
+        if ($existing !== '') esm_stat('kept');   // write suppressed — data survived
+    }
 }
 
 $created = $updated = $skipped = 0;
@@ -347,7 +406,7 @@ foreach ($units as $u) {
         'inw_wielkosc_projektu'       => $inv_extra['wielkosc_projektu'] ?? '',
     ];
     foreach ($metas as $k => $v) {
-        update_post_meta($post_id, $k, (string)$v);
+        esm_put($post_id, $k, $v);
     }
 
     // Unit amenities — only overwrite if scraper explicitly provided the key
@@ -493,11 +552,17 @@ foreach ($units as $u) {
     }
 }
 
+$stats = esm_stat();
 echo json_encode([
     'created' => $created,
     'updated' => $updated,
     'skipped' => $skipped,
     'errors'  => $errors,
+    // How many writes the guard suppressed (values that would have been
+    // erased) and how many it let through as deliberate clears. Reported so a
+    // sudden jump in 'cleared' is visible instead of silent.
+    'kept'    => $stats['kept'],
+    'cleared' => $stats['cleared'],
 ]);
 """
 
@@ -560,19 +625,26 @@ def upload_unit_images(ssh: SSHClient, units: list[dict], extra_terms: list = No
     if not files_to_upload:
         return
 
-    if redact_plan_image is not None:
-        redacted_count = 0
-        for _, _, local in files_to_upload:
-            try:
-                hits = redact_plan_image(local, extra_terms=extra_terms or [])
-                if hits:
-                    redacted_count += 1
-            except Exception as e:
-                log(f'  WARN: plan redaction failed for {local}: {e}')
-        if redacted_count:
-            log(f'  Redacted identifying text on {redacted_count}/{len(files_to_upload)} plan image(s)')
-    else:
-        log('  WARN: pytesseract not installed — skipping plan redaction (tesseract-ocr missing?)')
+    if redact_plan_image is None:
+        # No OCR stack, so nothing can be blurred. Publishing the plans anyway
+        # would put developer names and sales-office phone numbers straight
+        # onto the site — the exact thing redaction exists to prevent. Skip the
+        # upload entirely instead: every other field still syncs, and the plans
+        # get imported on the next run from a machine that has tesseract.
+        log(f'  WARN: pytesseract/tesseract missing — skipping upload of '
+            f'{len(files_to_upload)} plan image(s) rather than publishing them unredacted')
+        return
+
+    redacted_count = 0
+    for _, _, local in files_to_upload:
+        try:
+            hits = redact_plan_image(local, extra_terms=extra_terms or [])
+            if hits:
+                redacted_count += 1
+        except Exception as e:
+            log(f'  WARN: plan redaction failed for {local}: {e}')
+    if redacted_count:
+        log(f'  Redacted identifying text on {redacted_count}/{len(files_to_upload)} plan image(s)')
 
     sftp = ssh._client.open_sftp()
     try:
@@ -629,6 +701,18 @@ def sync_units(ssh: SSHClient, inv: dict, parent_id: int, projekt_term_id: int) 
     # phone/email/website/address patterns it always checks).
     upload_unit_images(ssh, units, extra_terms=[inv.get('developer', ''), inv.get('name', '')])
 
+    if redact_plan_image is None:
+        # Not uploading the plan files is not enough on its own: with no entry
+        # in plan_server_map the PHP falls through to media_sideload_image(),
+        # which pulls the untouched original straight off ExPro onto the WP
+        # server — the opposite of skipping. Blank the plan URLs out of the
+        # payload so the plan block is skipped entirely. Units that already
+        # have lokal_plan_attachment_id keep the plan they have.
+        payload['units'] = [
+            {**u, 'plan_urls': [], 'plan_url_map': {}, 'plan_server_map': {}}
+            for u in payload['units']
+        ]
+
     data_json = json.dumps(payload, ensure_ascii=False)
     ssh.write_remote_file(data_json, '/tmp/esm_units_data.json')
     ssh.write_remote_file(PHP_SYNC_UNITS, '/tmp/esm_sync_units.php')
@@ -645,6 +729,10 @@ def sync_units(ssh: SSHClient, inv: dict, parent_id: int, projekt_term_id: int) 
         if result.get('errors'):
             for e in result['errors']:
                 log(f'  ERROR: {e}')
+        kept, cleared = result.get('kept', 0), result.get('cleared', 0)
+        if kept or cleared:
+            log(f'  meta guard: {kept} write(s) suppressed (value survived), '
+                f'{cleared} deliberate clear(s)')
         return result.get('created', 0), result.get('updated', 0)
     except Exception:
         log(f'  WARNING: unexpected output: {out[:200]}')
