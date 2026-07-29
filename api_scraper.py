@@ -561,10 +561,32 @@ _MORE_INFO_MAP = {
     "miejsce postojowe obowiązkowe":        "parking_obowiazkowy",
     "komórki lokatorskie":                  "komorki_lokatorskie",
     "oferta wykończenia pod klucz":         "pod_klucz",
-    "cena miejsca postojowego naziemnego":  "parking_naziemne_cena",
-    "cena miejsca postojowego podziemnego": "parking_podziemne_cena",
-    "cena komórki lokatorskiej":            "komorka_cena",
+    # Prices. The labels state the thing, not "cena" — and note the singular
+    # "Komórka lokatorska" is the price while the plural "Komórki lokatorskie"
+    # above is the yes/no question.
+    "miejsce postojowe naziemne od":        "parking_naziemne_cena",
+    "miejsce postojowe podziemne pojedyncze": "parking_podziemne_cena",
+    "komórka lokatorska":                   "komorka_cena",
 }
+
+# Price fields whose "no data" is written as a number. ExPro renders an unset
+# price as "od 0,00 PLN/m2 do 0,00 PLN/m2", which would reach the site as a
+# free parking space.
+_PRICE_KEYS = {"parking_naziemne_cena", "parking_podziemne_cena", "komorka_cena"}
+
+
+def _is_zero_price(value: str) -> bool:
+    """True when every amount in the string is zero.
+
+    Only amounts stated in PLN count. Scanning for bare numbers picks up the
+    "2" in "PLN/m2" and concludes the value is non-zero, which is how a
+    placeholder "od 0,00 PLN/m2 do 0,00 PLN/m2" nearly reached the site as a
+    real price.
+    """
+    amounts = re.findall(r"([\d][\d\s]*(?:[.,]\d+)?)\s*PLN", value)
+    if not amounts:
+        return False
+    return all(float(a.replace(" ", "").replace(",", ".")) == 0 for a in amounts)
 
 def parse_investment_page(page: str) -> dict:
     """Pull the fields the REST API does not carry out of the detail page."""
@@ -584,7 +606,10 @@ def parse_investment_page(page: str) -> dict:
             # The anchor text is truncated with an ellipsis; the href is whole.
             out["developer_url"] = href or value
         elif low in _MORE_INFO_MAP and value:
-            out["extra"][_MORE_INFO_MAP[low]] = value
+            key = _MORE_INFO_MAP[low]
+            if key in _PRICE_KEYS and _is_zero_price(value):
+                continue
+            out["extra"][key] = value
         elif low == "ostatnia zmiana w expro":
             out["last_change"] = value
         elif low == "synchronizacja z dane.gov.pl":
