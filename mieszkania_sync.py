@@ -84,6 +84,10 @@ $inv_extra     = $data['inv_extra'] ?? [];
 $parent_id     = (int)$data['parent_id'];
 $projekt_tid   = (int)$data['projekt_term_id'];
 $label_tid     = 181; // Rynek Pierwotny
+// Axis B. Resolved by slug, not pinned to an ID, so a rebuilt term still lands
+// and a missing one degrades to "no marker" instead of a fatal.
+$_inw          = get_term_by('slug', 'inwestycyjne', 'property_label');
+$label_inw_tid = $_inw ? (int) $_inw->term_id : 0;
 
 $status_map = [
     'dostępne'      => 'wolny',
@@ -180,6 +184,17 @@ if (!function_exists('esm_type_from_label')) {
         if (str_contains($t, 'inwestycyjn'))                            return 'mieszkanie';
         if (str_contains($t, 'mieszkanie') || str_contains($t, 'apartament')) return 'mieszkanie';
         return '';
+    }
+}
+if (!function_exists('esm_is_investment')) {
+    // The other half of the sentence above. esm_type_from_label answers what a
+    // unit physically is and deliberately forgets that it is sold as an
+    // investment product, which for a year meant nothing recorded it at all:
+    // 211 units across five investments were shelved next to ordinary flats.
+    // ExPro's dictionary has two investment types — "Nieruchomość inwestycyjna"
+    // and "Apartament inwestycyjny" — and both share this stem.
+    function esm_is_investment($raw) {
+        return str_contains(esm_norm($raw), 'inwestycyjn');
     }
 }
 if (!function_exists('esm_looks_like_house')) {
@@ -598,7 +613,16 @@ foreach ($units as $u) {
     if (array_key_exists('has_garage',   $u)) update_post_meta($post_id, 'lokal_garaz',   $u['has_garage']   ? '1' : '0');
 
     // ── Taxonomies ───────────────────────────────────────────────────────
-    wp_set_object_terms($post_id, [$label_tid], 'property_label');
+    // A unit can now carry two labels. Order here means nothing —
+    // wp_get_post_terms sorts by name, so "Inwestycyjne" sorts ahead of "Rynek
+    // Pierwotny" wherever it is added. The catalogue used to take labels[0] as
+    // the availability badge; that read is fixed in page-rynek-pierwotny.php
+    // and page-katalog-mieszkan.php to select by slug instead of by position.
+    $labels = [$label_tid];
+    if ($label_inw_tid && esm_is_investment($u['Typ'] ?? $u['type'] ?? '')) {
+        $labels[] = $label_inw_tid;
+    }
+    wp_set_object_terms($post_id, $labels, 'property_label');
     wp_set_object_terms($post_id, [$status_slug, 'sprzedaz'], 'property_status');
     wp_set_object_terms($post_id, [$type_slug],   'property_type');
     if ($projekt_tid) {
