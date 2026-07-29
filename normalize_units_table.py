@@ -279,7 +279,11 @@ echo "OK rows_affected={$affected}\n";
 
 
 def push_rows(ssh: SSHClient, rows: list, chunk_size: int = 200) -> str:
-    synced_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # UTC, because that is what the database runs on. Stamping these with the
+    # local clock put every row two hours into the future as far as MySQL was
+    # concerned, so "gone_at < NOW()" was false for all 744 marked units and
+    # the reconciliation found nothing to do while looking like it worked.
+    synced_at = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     total = len(rows)
     ssh.write_remote_file(_PUSH_ROWS_PHP, "/tmp/esm_norm_push.php")
     for i in range(0, total, chunk_size):

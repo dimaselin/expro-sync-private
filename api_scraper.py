@@ -756,7 +756,18 @@ def fill_from_html_concurrent(session: requests.Session, results: list[dict]) ->
 # Hash (same logic as old scraper for change detection)
 # ---------------------------------------------------------------------------
 
+def units_digest(units: list) -> str:
+    """Order-independent fingerprint of what every unit costs and whether it is free."""
+    parts = sorted(
+        f"{u.get('name','')}|{u.get('price_raw','')}|{u.get('status','')}"
+        for u in units or []
+    )
+    return hashlib.md5("\n".join(parts).encode()).hexdigest()
+
+
 def scrape_hash(inv: dict) -> str:
+    inv = dict(inv)
+    inv["units_digest"] = units_digest(inv.get("units") or [])
     key = json.dumps(
         {k: inv.get(k) for k in
          ["name", "price_from_raw", "delivery", "units_count",
@@ -770,7 +781,14 @@ def scrape_hash(inv: dict) -> str:
           # investment whose hash matches, so the first test of these wrote
           # nothing at all.
           "source_name", "count_all", "rating",
-          "delivery_to", "developer_id"]},
+          "delivery_to", "developer_id",
+          # A digest of every unit's price and status. Without it the hash only
+          # moved when investment-level figures did, so a developer repricing a
+          # single flat changed nothing wp_sync could see and the unit table on
+          # the investment page kept the old number — 179 units were stale that
+          # way when this was measured. The digest rather than the units
+          # themselves keeps the hash input small and order-independent.
+          "units_digest"]},
         ensure_ascii=False, sort_keys=True,
     )
     return hashlib.md5(key.encode()).hexdigest()

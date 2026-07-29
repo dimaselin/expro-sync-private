@@ -207,7 +207,30 @@ jobs:
             echo "| Zdjęć lokali | $PHOTOS |" >> $GITHUB_STEP_SUMMARY
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
+          # Health lines. Every one of these was a defect that ran silently for
+          # weeks — a unit with no type is classified by default, a dropped
+          # detail response used to be cached as fact, and an unparsed page
+          # means an investment quietly loses its lift/heating/documents. If a
+          # number here is not zero, the run "succeeded" and still lost data.
           if [ -f logs/sync.log ]; then
+            echo "### Kontrola jakości" >> $GITHUB_STEP_SUMMARY
+            echo "| Sygnał | Wartość |" >> $GITHUB_STEP_SUMMARY
+            echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+            grep -oE "unit details: [0-9]+ failed[^;]*; [0-9]+/[0-9]+ units without a type, [0-9]+ without a plan" logs/sync.log | tail -1 | \
+              sed -E 's/unit details: ([0-9]+) failed.*; ([0-9]+)\/([0-9]+) units without a type, ([0-9]+) without a plan/| Detale nieudane | \1 |\n| Lokale bez typu | \2 z \3 |\n| Lokale bez rzutu | \4 |/' >> $GITHUB_STEP_SUMMARY
+            grep -oE "pages read: [0-9]+/[0-9]+" logs/sync.log | tail -1 | \
+              sed -E 's#pages read: ([0-9]+)/([0-9]+)#| Strony inwestycji odczytane | \1 z \2 |#' >> $GITHUB_STEP_SUMMARY
+            NIESK=$(grep -oE "[0-9]+ unit\(s\) no signal could place" logs/sync.log | grep -oE "^[0-9]+" | paste -sd+ - | bc 2>/dev/null || echo 0)
+            echo "| Lokale niesklasyfikowane | ${NIESK:-0} |" >> $GITHUB_STEP_SUMMARY
+            DRAFT=$(grep -oE "[0-9]+ previously published unit" logs/sync.log | grep -oE "^[0-9]+" | paste -sd+ - | bc 2>/dev/null || echo 0)
+            echo "| Zdjęte z publikacji | ${DRAFT:-0} |" >> $GITHUB_STEP_SUMMARY
+            grep -oE "\{'newly_gone': [0-9]+, 'returned': [0-9]+, 'gone_total': [0-9]+\}" logs/sync.log | tail -1 | \
+              sed -E "s/\{'newly_gone': ([0-9]+), 'returned': ([0-9]+), 'gone_total': ([0-9]+)\}/| Zniknęły z ExPro (nowe) | \1 |\n| Wróciły | \2 |\n| Zniknięte łącznie | \3 |/" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            if grep -q "WARNING: units without a type\|no signal could place\|WARN units: collected" logs/sync.log; then
+              echo "> ⚠️ Ostrzeżenia w logu — sprawdź sekcję poniżej." >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
             echo "### Ostatnie logi" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
             tail -60 logs/sync.log >> $GITHUB_STEP_SUMMARY
