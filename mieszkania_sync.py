@@ -187,17 +187,38 @@ if (!function_exists('esm_type_from_label')) {
         return '';
     }
 }
-if (!function_exists('esm_name_says')) {
-    // Used only to correct the one failure mode ExPro is known for: labelling
-    // every unit of a housing estate "Mieszkanie". Never promotes a unit that
-    // already resolved to something specific.
-    function esm_name_says($name) {
+if (!function_exists('esm_looks_like_house')) {
+    // The investment name must never decide this. "Wille Biskupin" sells flats
+    // — units on floors 0 to 2, 45 to 107 m², and ExPro correctly reports
+    // Mieszkanie — but a rule that read "wille" as houses overruled that
+    // correct answer and filed 72 flats as detached houses.
+    //
+    // ExPro's building_type_id is no substitute on its own either: bt=4 is
+    // mostly house developments, yet Osiedle Ferrovia sits there with 100
+    // units of 25-61 m², which are plainly flats.
+    //
+    // So the promotion is per unit and needs all three to agree: ExPro filed
+    // the development as houses, this unit is on the ground floor, and it is
+    // the size of a house. A unit that fails any of them stays what ExPro
+    // called it. Applied per unit rather than per investment, which is what
+    // makes genuinely mixed developments work: in Małe Wilczyce a 56 m²
+    // ground-floor unit stays a flat while a 118 m² one does not.
+    function esm_looks_like_house($u, $inv) {
+        $bt = (string)($inv['building_type_id'] ?? '');
+        if (!in_array($bt, ['4', '7'], true)) return false;
+        $floor = trim((string)($u['floor'] ?? $u['Piętro'] ?? ''));
+        if ($floor !== '' && $floor !== '0') return false;
+        $area = (float) str_replace(',', '.', (string)($u['area_raw'] ?? $u['Powierzchnia'] ?? '0'));
+        return $area >= 100.0;
+    }
+}
+if (!function_exists('esm_name_says_commercial')) {
+    // Kept only for premises, where the name is a statement of use rather than
+    // marketing: "lokale usługowe" is what the thing is, not what it is called.
+    function esm_name_says_commercial($name) {
         $n = esm_norm($name);
-        foreach (['wille', 'willa', ' domy', 'domy ', 'szereg', 'blizniak', 'wolnostoj'] as $p) {
-            if (str_contains($n, $p)) return 'dom';
-        }
         foreach (['lokal uslug', 'lokale uslug', 'lokal uzytk', 'lokale uzytk',
-                  'wykonczeni', 'zarzadzanie najmem'] as $p) {
+                  'lokale biurowe', 'wykonczeni', 'zarzadzanie najmem'] as $p) {
             if (str_contains($n, $p)) return 'lokal-uzytkowy';
         }
         return '';
@@ -212,8 +233,9 @@ if (!function_exists('esm_dom_subtype')) {
         $n = esm_norm($name);
         if (str_contains($n, 'szereg') || str_contains($n, 'segment')) return 'dom-szeregowy';
         if (str_contains($n, 'blizniak'))                              return 'dom-blizniaczy';
-        if (str_contains($n, 'wolnostoj') || str_contains($n, 'wille')
-            || str_contains($n, 'willa'))                              return 'dom-wolnostojacy';
+        // "wille"/"willa" is deliberately absent: it is a marketing word, not a
+        // building type. Wille Biskupin sells flats.
+        if (str_contains($n, 'wolnostoj'))                             return 'dom-wolnostojacy';
         return 'dom';
     }
 }
@@ -242,9 +264,17 @@ if (!function_exists('esm_resolve_type')) {
                 if ($slug) { $src = 'expro_types'; break; }
             }
         }
+        // Premises: the name states a use rather than a brand, so it may
+        // correct a unit ExPro left as "Mieszkanie".
         if ($slug === 'mieszkanie') {
-            $by_name = esm_name_says($inv['name'] ?? '');
+            $by_name = esm_name_says_commercial($inv['name'] ?? '');
             if ($by_name) { $slug = $by_name; $src = ($src ?: 'none') . '+name'; }
+        }
+        // Houses: decided by measurement, never by the name. All three of
+        // building type, ground floor and house-sized area must agree.
+        if ($slug === 'mieszkanie' && esm_looks_like_house($u, $inv)) {
+            $slug = 'dom';
+            $src  = ($src ?: 'none') . '+profil';
         }
         if ($slug === 'dom') $slug = esm_dom_subtype($inv['name'] ?? '');
         if (!$slug) return ['niesklasyfikowane', 'none'];
