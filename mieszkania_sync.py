@@ -29,19 +29,14 @@ AMENITY_DATA = Path(__file__).parent / 'data' / 'amenity_data.json'
 PROGRESS     = Path(__file__).parent / 'data' / 'mieszkania_sync_progress.json'
 LOG_FILE     = Path(__file__).parent / 'data' / 'mieszkania_sync.log'
 
-# ExPro IDs that are ONLY Dom — never overwrite their projekt_typ
-_DOM_ONLY_IDS = None  # type: ignore
-
-def _dom_only_ids() -> set:
-    global _DOM_ONLY_IDS
-    if _DOM_ONLY_IDS is None:
-        data = json.loads(DATA.read_text('utf-8'))
-        _DOM_ONLY_IDS = {
-            str(d['expro_id']) for d in data
-            if all(u.get('type', '') in ('Dom', 'Segment', '') for u in d.get('units', []))
-            and any(u.get('type', '') == 'Dom' for u in d.get('units', []))
-        }
-    return _DOM_ONLY_IDS
+# A guard that skipped every all-houses investment used to live here, to stop
+# this script from overwriting their projekt_typ. It never wrote projekt_typ —
+# the only mention of that field in this file was the guard's own comment — so
+# it protected nothing, while excluding 37 investments and 229 house units from
+# the sync entirely. Their prices, statuses, coordinates and types sat
+# untouched since 2026-07-09, and every one of them still carried the old
+# forced "dom-szeregowy". Type is decided per unit now, so there is nothing
+# left for such a guard to defend.
 
 # ── Taxonomy term IDs (verified on site) ─────────────────────────────────────
 LABEL_RYNEK_PIERWOTNY = 181   # property_label: Rynek Pierwotny
@@ -301,6 +296,16 @@ if (!function_exists('esm_put')) {
         $existing = (string) get_post_meta($post_id, $key, true);
         if ($val !== '') {
             update_post_meta($post_id, $key, $val);
+            return;
+        }
+        // "None" is Python's str(None) that leaked through the old scraper, not
+        // a value anyone stored on purpose. Without this the guard defends it:
+        // the correct answer is empty, so the write is skipped and the garbage
+        // survives every run. 832 rows came back this way after a cron ran the
+        // old code over a database that had just been cleaned.
+        if ($existing === 'None') {
+            update_post_meta($post_id, $key, '');
+            esm_stat('cleared');
             return;
         }
         if (in_array($key, $clearable, true)) {
@@ -1011,11 +1016,6 @@ def sync_one(ssh: SSHClient, inv: dict, post_map: dict) -> tuple[SSHClient, str]
 
     _log(f'\n{"="*60}')
     _log(f'[{expro_id}] {name} — {len(units)} units')
-
-    # Guard: never touch pure-Dom investments
-    if expro_id in _dom_only_ids():
-        _log(f'  SKIP: Dom-only investment — not touching')
-        return ssh, 'skip'
 
     parent_id = post_map.get(expro_id)
     if not parent_id:
