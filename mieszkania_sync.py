@@ -71,6 +71,11 @@ TYPE_SLUG_MAP = {
     'komercja':      'komercja',
 }
 
+# Per-investment override of the resolved unit type. Deliberately empty: the
+# classifier reads five signals and reports what it could not place, so an
+# entry here means someone checked that investment by hand and ExPro is wrong.
+_UNIT_TYPE_OVERRIDES: dict[str, str] = {}
+
 # ── PHP template executed via eval-file ──────────────────────────────────────
 
 PHP_SYNC_UNITS = r"""<?php
@@ -145,6 +150,107 @@ if (!function_exists('esm_is_yes')) {
         return !in_array($v, $no, true);
     }
 }
+// ── Type resolution ───────────────────────────────────────────────────────
+// The old rule was five strpos calls over a free-text label with "mieszkanie"
+// as the fallback, so anything unrecognised became a flat: 137 units labelled
+// "Nieruchomość inwestycyjna", 84 with no label at all, and 3 "Segment" — a
+// row house — are flats on the site today purely because no pattern matched.
+// Nothing is guessed here. A unit no signal can place goes to
+// `niesklasyfikowane` and is not published, so it shows up in the run summary
+// instead of quietly joining the flats.
+if (!function_exists('esm_norm')) {
+    function esm_norm($s) {
+        $s = mb_strtolower(trim((string) $s));
+        return strtr($s, ['ł'=>'l','ż'=>'z','ź'=>'z','ó'=>'o','ą'=>'a','ę'=>'e','ć'=>'c','ń'=>'n','ś'=>'s']);
+    }
+}
+if (!function_exists('esm_type_from_label')) {
+    // ExPro's own vocabulary (realestate_type_id: Mieszkanie, Dom, Lokal
+    // użytkowy, Nieruchomość inwestycyjna, Wykończenie, Apartament
+    // inwestycyjny, Segment, Firmy budowlane/Domy modułowe, Zarządzanie
+    // najmem) plus the free-text values the feed still emits.
+    function esm_type_from_label($raw) {
+        $t = esm_norm($raw);
+        if ($t === '') return '';
+        // Not addressable real estate — these must never resolve to a type.
+        if (str_contains($t, 'modulow') || str_contains($t, 'wykonczeni')
+            || str_contains($t, 'zarzadzanie najmem') || str_contains($t, 'firmy budowlane')) return '';
+        if (str_contains($t, 'lokal') || str_contains($t, 'biuro') || str_contains($t, 'uslug')) return 'lokal-uzytkowy';
+        if (str_contains($t, 'segment') || str_contains($t, 'szereg'))  return 'dom-szeregowy';
+        if (str_contains($t, 'blizniak'))                               return 'dom-blizniaczy';
+        if (str_contains($t, 'wolnostoj'))                              return 'dom-wolnostojacy';
+        if (str_contains($t, 'dom'))                                    return 'dom';
+        // An investment product is still physically a flat; what makes it an
+        // investment is carried on property_label, not on the type.
+        if (str_contains($t, 'inwestycyjn'))                            return 'mieszkanie';
+        if (str_contains($t, 'mieszkanie') || str_contains($t, 'apartament')) return 'mieszkanie';
+        return '';
+    }
+}
+if (!function_exists('esm_name_says')) {
+    // Used only to correct the one failure mode ExPro is known for: labelling
+    // every unit of a housing estate "Mieszkanie". Never promotes a unit that
+    // already resolved to something specific.
+    function esm_name_says($name) {
+        $n = esm_norm($name);
+        foreach (['wille', 'willa', ' domy', 'domy ', 'szereg', 'blizniak', 'wolnostoj'] as $p) {
+            if (str_contains($n, $p)) return 'dom';
+        }
+        foreach (['lokal uslug', 'lokale uslug', 'lokal uzytk', 'lokale uzytk',
+                  'wykonczeni', 'zarzadzanie najmem'] as $p) {
+            if (str_contains($n, $p)) return 'lokal-uzytkowy';
+        }
+        return '';
+    }
+}
+if (!function_exists('esm_dom_subtype')) {
+    // ExPro only ever says "Dom". Rather than invent a subtype — which is how
+    // all 246 houses became "szeregowy" and left the "Dom wolnostojący" filter
+    // permanently empty — the name is asked, and a bare `dom` is a perfectly
+    // valid answer when it stays silent.
+    function esm_dom_subtype($name) {
+        $n = esm_norm($name);
+        if (str_contains($n, 'szereg') || str_contains($n, 'segment')) return 'dom-szeregowy';
+        if (str_contains($n, 'blizniak'))                              return 'dom-blizniaczy';
+        if (str_contains($n, 'wolnostoj') || str_contains($n, 'wille')
+            || str_contains($n, 'willa'))                              return 'dom-wolnostojacy';
+        return 'dom';
+    }
+}
+if (!function_exists('esm_rodzaj')) {
+    function esm_rodzaj($slug) {
+        if ($slug === 'mieszkanie') return 'mieszkanie';
+        if (str_starts_with($slug, 'dom')) return 'dom';
+        if (str_starts_with($slug, 'lokal') || $slug === 'komercja') return 'lokal';
+        return 'unknown';
+    }
+}
+if (!function_exists('esm_resolve_type')) {
+    function esm_resolve_type($u, $inv) {
+        if (!empty($inv['type_override'])) return [$inv['type_override'], 'override'];
+
+        $slug = esm_type_from_label($u['Typ'] ?? $u['type'] ?? '');
+        $src  = $slug ? 'unit' : '';
+
+        // The investment's filing in ExPro's dictionary — the fallback for a
+        // unit that reports nothing. It is deliberately below the unit: Domy
+        // pod Lasem is filed under Mieszkanie while every one of its units
+        // reports Segment, and the unit is the thing being classified.
+        if (!$slug) {
+            foreach ((array)($inv['expro_types'] ?? []) as $t) {
+                $slug = esm_type_from_label($t);
+                if ($slug) { $src = 'expro_types'; break; }
+            }
+        }
+        if ($slug === 'mieszkanie') {
+            $by_name = esm_name_says($inv['name'] ?? '');
+            if ($by_name) { $slug = $by_name; $src = ($src ?: 'none') . '+name'; }
+        }
+        if ($slug === 'dom') $slug = esm_dom_subtype($inv['name'] ?? '');
+        if (!$slug) return ['niesklasyfikowane', 'none'];
+        return [$slug, $src];
+    }
+}
 if (!function_exists('esm_put')) {
     function esm_put($post_id, $key, $val) {
         static $clearable = [
@@ -178,6 +284,9 @@ if (!function_exists('esm_put')) {
 
 $created = $updated = $skipped = 0;
 $errors  = [];
+$type_counts = [];
+$src_counts  = [];
+$unpublished = 0;
 
 foreach ($units as $u) {
     $uid = trim($u['realestate_id'] ?? '');
@@ -274,20 +383,26 @@ foreach ($units as $u) {
     $status_slug = $status_map[$status_key] ?? 'wolny';
 
     // ── Type → taxonomy slug ─────────────────────────────────────────────
-    $typ      = strtolower($u['Typ'] ?? $u['type'] ?? '');
-    $type_slug = 'mieszkanie';
-    $typ_label = 'Mieszkanie';
-    if (strpos($typ, 'lokal') !== false || strpos($typ, 'biuro') !== false) {
-        $type_slug = 'lokal-uzytkowy'; $typ_label = 'Lokal użytkowy';
-    } elseif (strpos($typ, 'blizniak') !== false || strpos($typ, 'bliźniak') !== false) {
-        $type_slug = 'blizniak'; $typ_label = 'Bliźniak';
-    } elseif (strpos($typ, 'szereg') !== false) {
-        $type_slug = 'dom-szeregowy'; $typ_label = 'Dom szeregowy';
-    } elseif (strpos($typ, 'wolnostoj') !== false) {
-        $type_slug = 'dom-wolnostojacy'; $typ_label = 'Dom wolnostojący';
-    } elseif (strpos($typ, 'dom') !== false) {
-        $type_slug = 'dom-szeregowy'; $typ_label = 'Dom';
-    }
+    [$type_slug, $type_src] = esm_resolve_type($u, $inv);
+    $rodzaj = esm_rodzaj($type_slug);
+    $typ_label = [
+        'mieszkanie'        => 'Mieszkanie',
+        'dom'               => 'Dom',
+        'dom-szeregowy'     => 'Dom szeregowy',
+        'dom-blizniaczy'    => 'Dom bliźniaczy',
+        'dom-wolnostojacy'  => 'Dom wolnostojący',
+        'lokal-uzytkowy'    => 'Lokal użytkowy',
+        'niesklasyfikowane' => 'Nieruchomość',
+    ][$type_slug] ?? 'Nieruchomość';
+    $type_counts[$type_slug] = ($type_counts[$type_slug] ?? 0) + 1;
+    $src_counts[$type_src]   = ($src_counts[$type_src] ?? 0) + 1;
+
+    // Only real, addressable homes go live. Commercial premises have no
+    // template of their own and would render through the houses layout, and an
+    // unclassified unit has no business being advertised at all — better a
+    // draft that shows up in the summary than a wrong page in the catalogue.
+    $publishable   = in_array($rodzaj, ['mieszkanie', 'dom'], true);
+    $target_status = $publishable ? 'publish' : 'draft';
 
     // ── Address ──────────────────────────────────────────────────────────
     $street  = $inv['street'] ?? '';
@@ -312,7 +427,7 @@ foreach ($units as $u) {
     // Polish decimal comma, matching every other number on the page. The raw
     // value carries a dot ("99.88"), which the rendered page never uses.
     if ($area) { $area_txt = str_replace('.', ',', (string)$area); $content .= " o powierzchni {$area_txt} m²"; }
-    if ($floor_disp && in_array($type_slug, ['mieszkanie', 'lokal-uzytkowy'])) {
+    if ($floor_disp && in_array($rodzaj, ['mieszkanie', 'lokal'], true)) {
         $content .= ", {$floor_disp}";
     }
     $content .= ". Inwestycja: <strong>{$inv['name']}</strong>";
@@ -356,7 +471,8 @@ foreach ($units as $u) {
     // ── Create or update post ────────────────────────────────────────────
     if (!empty($existing)) {
         $post_id   = (int)$existing[0];
-        $upd_args  = ['ID' => $post_id, 'post_title' => $title, 'post_status' => 'publish'];
+        $upd_args  = ['ID' => $post_id, 'post_title' => $title, 'post_status' => $target_status];
+        if ($target_status === 'draft' && get_post_status($post_id) === 'publish') $unpublished++;
         // Skip overwriting description if manually locked
         if (!get_post_meta($post_id, '_description_locked', true)) {
             $upd_args['post_content'] = $content;
@@ -369,7 +485,7 @@ foreach ($units as $u) {
             'post_name'    => 'lokal-' . $uid,
             'post_content' => $content,
             'post_type'    => 'property',
-            'post_status'  => 'publish',
+            'post_status'  => $target_status,
             'post_author'  => 1,
         ]);
         if (is_wp_error($post_id)) {
@@ -409,6 +525,10 @@ foreach ($units as $u) {
         'lokal_cena_m2'               => $price_m2,
         'lokal_status_expro'          => $status_key,
         'lokal_etap'                  => $etap,
+        // Which signal placed this unit, so a wrong type can be traced to
+        // its source instead of being re-guessed.
+        'lokal_typ_slug'              => $type_slug,
+        'lokal_typ_zrodlo'            => $type_src,
         // Unit amenities — only write if explicitly provided (absent = preserve existing WP value)
         'lokal_balkon_m2'             => $u['balcony_area'] ?? '',
         'lokal_taras_m2'              => $u['terrace_area'] ?? '',
@@ -598,6 +718,9 @@ echo json_encode([
     // sudden jump in 'cleared' is visible instead of silent.
     'kept'    => $stats['kept'],
     'cleared' => $stats['cleared'],
+    'types'       => $type_counts,
+    'type_srcs'   => $src_counts,
+    'unpublished' => $unpublished,
 ]);
 """
 
@@ -735,6 +858,13 @@ def sync_units(ssh: SSHClient, inv: dict, parent_id: int, projekt_term_id: int) 
             'lat':       lat,
             'lng':       lng,
             'delivery':  inv.get('delivery', ''),
+            # ExPro's own filing for this investment — the classifier's
+            # fallback for units that report no type of their own.
+            'expro_types': inv.get('expro_types', []),
+            # Escape hatch for an investment ExPro has plainly mislabelled.
+            # Empty by design: an entry here is a claim we have checked.
+            'type_override': _UNIT_TYPE_OVERRIDES.get(
+                str(inv.get('expro_id') or inv.get('id', '')), ''),
         },
         'inv_extra':       inv.get('extra', {}),
         'parent_id':       parent_id,
@@ -779,6 +909,16 @@ def sync_units(ssh: SSHClient, inv: dict, parent_id: int, projekt_term_id: int) 
         if kept or cleared:
             log(f'  meta guard: {kept} write(s) suppressed (value survived), '
                 f'{cleared} deliberate clear(s)')
+        types = result.get('types', {})
+        if types:
+            log('  types: ' + ', '.join(f'{k}={v}' for k, v in sorted(types.items())))
+            log('  signal: ' + ', '.join(f'{k or "none"}={v}'
+                                        for k, v in sorted(result.get('type_srcs', {}).items())))
+        if types.get('niesklasyfikowane'):
+            log(f'  WARNING: {types["niesklasyfikowane"]} unit(s) no signal could place — left unpublished')
+        if result.get('unpublished'):
+            log(f'  {result["unpublished"]} previously published unit(s) moved to draft '
+                f'(commercial premises or unclassified)')
         return result.get('created', 0), result.get('updated', 0)
     except Exception:
         log(f'  WARNING: unexpected output: {out[:200]}')
