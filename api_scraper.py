@@ -7,12 +7,12 @@ Output schema is backward-compatible with wp_sync.py and mieszkania_sync.py.
 New fields added (bonus):
   expro_uuid, postal_code, latitude, longitude, price_to, price_to_raw, rooms_from, rooms_to
 
-Fields unavailable via API (handled gracefully):
-  developer_url     → "" (wp_sync.py only writes if non-empty, so WP value preserved)
-  documents         → [] (wp_sync.py only writes if non-empty)
-  (zasady_wspolpracy IS collected — separate HTML pass, see fill_zasady_concurrent)
-  extra.*           → parsed from description text where present; otherwise ""
-                      (wp_sync.py has `if value:` guard, so existing WP values preserved)
+Fields the REST API does not carry are read from the investment's detail page
+instead — the same page already downloaded for the commission terms, so at no
+extra cost (see parse_investment_page / fill_from_html_concurrent):
+  developer_url, documents, zasady_wspolpracy, contact e-mail and phone,
+  the real last-change date (the API only offers creation_date), and the
+  thirteen `extra.*` amenity answers that live in "Więcej informacji".
   per-unit Phase 2  → bedrooms/bathrooms/has_balcony etc. → absent or default
                       mieszkania_sync.py has fallbacks for all of these
 
@@ -505,6 +505,121 @@ ZASADY_LABELS = {
     "waznosc_zgloszenia": "Ważność zgłoszenia",
 }
 
+# ---------------------------------------------------------------------------
+# Everything else the detail page carries
+# ---------------------------------------------------------------------------
+# The REST API's `description` holds exactly seven labels; every other field the
+# old Playwright scraper used to collect lived in the page's "Więcej informacji"
+# block and was lost in the migration — all 13 of these read empty on all 173
+# investments today, along with developer_url and documents. The page is
+# already downloaded on every run for the commission terms, so this costs no
+# extra requests.
+#
+# The page states all of them the same way: a div holding <b>Label</b> and the
+# value, either inline after a colon or in a <span> under a <br>.
+
+# The class carries modifiers on some blocks ("left-col-content-element d-flex"
+# holds the contact details), so the match cannot demand an exact class.
+_ELEMENT_RE = re.compile(r'<div class="[^"]*left-col-content-element[^"]*"[^>]*>(.*?)</div>', re.S)
+_LABEL_RE = re.compile(r"<b>(.*?)</b>", re.S)
+
+
+def _plain(fragment: str) -> str:
+    """Tag soup to readable text."""
+    import html as _html
+    txt = re.sub(r"<[^>]+>", " ", fragment)
+    return re.sub(r"\s+", " ", _html.unescape(txt)).strip()
+
+
+def _page_elements(page: str):
+    """Yield (label, value, href) for every labelled element on the page."""
+    import html as _html
+    for match in _ELEMENT_RE.finditer(page):
+        chunk = match.group(1)
+        label_m = _LABEL_RE.search(chunk)
+        if not label_m:
+            continue
+        label = _plain(label_m.group(1)).rstrip(":").strip()
+        rest = chunk[label_m.end():]
+        href_m = re.search(r'href="([^"]+)"', rest)
+        value = _plain(rest).lstrip(":").strip()
+        yield label, value, (_html.unescape(href_m.group(1)) if href_m else "")
+
+
+# Page label → key in the investment's `extra` block. Matched exactly, because
+# "Miejsce postojowe" and "Miejsce postojowe obowiązkowe" are different
+# questions and a substring match would confuse them.
+_MORE_INFO_MAP = {
+    "winda":                                "winda",
+    "rodzaj ogrzewania":                    "rodzaj_ogrzewania",
+    "rodzaj okien":                         "rodzaj_okien",
+    "forma własności":                      "forma_wlasnosci",
+    "smart home":                           "smart_home",
+    "stacja ładowania sam. elektrycznych":  "stacja_ev",
+    "rodzaje ochrony":                      "rodzaje_ochrony",
+    "miejsce postojowe":                    "miejsce_postojowe",
+    "miejsce postojowe obowiązkowe":        "parking_obowiazkowy",
+    "komórki lokatorskie":                  "komorki_lokatorskie",
+    "oferta wykończenia pod klucz":         "pod_klucz",
+    "cena miejsca postojowego naziemnego":  "parking_naziemne_cena",
+    "cena miejsca postojowego podziemnego": "parking_podziemne_cena",
+    "cena komórki lokatorskiej":            "komorka_cena",
+}
+
+def parse_investment_page(page: str) -> dict:
+    """Pull the fields the REST API does not carry out of the detail page."""
+    out: dict = {
+        "extra": {},
+        "zasady": {},
+        "developer_url": "",
+        "documents": [],
+        "last_change": "",
+        "danegov_sync": "",
+        "danegov_price_update": "",
+        "contact": {},
+    }
+    for label, value, href in _page_elements(page):
+        low = label.lower()
+        if low == "strona internetowa":
+            # The anchor text is truncated with an ellipsis; the href is whole.
+            out["developer_url"] = href or value
+        elif low in _MORE_INFO_MAP and value:
+            out["extra"][_MORE_INFO_MAP[low]] = value
+        elif low == "ostatnia zmiana w expro":
+            out["last_change"] = value
+        elif low == "synchronizacja z dane.gov.pl":
+            out["danegov_sync"] = value
+        elif low == "aktualizacja cen dewelopera na dane.gov.pl":
+            out["danegov_price_update"] = value
+
+    docs_m = re.search(
+        r'<div class="left-col-content investment_documents">(.*?)</div>\s*</div>', page, re.S
+    )
+    if docs_m:
+        block = docs_m.group(1)
+        names = [_plain(x) for x in re.findall(r"<p[^>]*>(.*?)</p>", block, re.S)]
+        links = re.findall(r'href="([^"]*/document/download/[^"]*)"', block)
+        for idx, name in enumerate(names):
+            if not name:
+                continue
+            url = links[idx] if idx < len(links) else ""
+            out["documents"].append({"name": name, "url": f"{BASE_URL}{url}" if url else ""})
+
+    # The contact block has no mailto:/tel: links — the values sit in a <p>
+    # next to an icon, so the icon class is what identifies them.
+    mail = re.search(r"fa-envelope.*?<p[^>]*>(.*?)</p>", page, re.S)
+    if mail:
+        out["contact"]["email"] = _plain(mail.group(1))
+    tel = re.search(r"fa-phone.*?<p[^>]*>(.*?)</p>", page, re.S)
+    if tel:
+        out["contact"]["phone"] = re.sub(r"\s+", "", _plain(tel.group(1)))
+
+    # Commission terms keep their own proven reader: it resolves 170 of 170
+    # investments today and there is nothing to gain from rewriting it here.
+    out["zasady"] = parse_zasady(page)
+    return out
+
+
 def parse_zasady(html: str) -> dict:
     """Extract the 'Zasady współpracy' block from an investment detail page.
 
@@ -535,42 +650,80 @@ def parse_zasady(html: str) -> dict:
             break
     return out
 
-def fetch_zasady(session: requests.Session, inv_id: str) -> dict:
+def fetch_investment_page(session: requests.Session, inv_id: str) -> dict:
     url = f"{BASE_URL}/investments/viewdetails/id/{inv_id}/"
     for _ in range(3):
         try:
             resp = session.get(url, timeout=60)
             if resp.status_code == 200:
-                return parse_zasady(resp.text)
+                return parse_investment_page(resp.text)
         except Exception:
             time.sleep(1)
     return {}
 
-def fill_zasady_concurrent(session: requests.Session, results: list[dict]) -> int:
-    """Fetch commission terms for every investment and refresh scrape_hash.
 
-    Must run before the JSON is written: scrape_hash() covers
-    zasady_wspolpracy, so a rate change has to flip the hash and trigger a
-    wp_sync update.
+def fill_from_html_concurrent(session: requests.Session, results: list[dict]) -> dict:
+    """Merge everything the detail page carries that the REST API does not.
+
+    Must run before the JSON is written: scrape_hash() covers these fields, so
+    a changed commission rate or a newly published website has to flip the hash
+    and trigger a wp_sync update.
+
+    Nothing here overwrites a value the API already supplied — the page fills
+    gaps, it does not arbitrate. The one exception is last_updated_expro, which
+    the API cannot answer at all: it offers creation_date, and this page states
+    the actual date of last change.
     """
-    filled = 0
+    stats = {k: 0 for k in ("page", "extra", "developer_url", "documents",
+                            "zasady", "contact", "last_change")}
     with ThreadPoolExecutor(max_workers=6) as pool:
         futures = {
-            pool.submit(fetch_zasady, session, inv["expro_id"]): inv
+            pool.submit(fetch_investment_page, session, inv["expro_id"]): inv
             for inv in results
         }
         for fut in as_completed(futures):
             inv = futures[fut]
             try:
-                zasady = fut.result()
+                page = fut.result()
             except Exception as e:
-                log(f"  zasady ERROR ID={inv['expro_id']}: {e}")
+                log(f"  page ERROR ID={inv['expro_id']}: {e}")
                 continue
-            if zasady:
-                inv["zasady_wspolpracy"] = zasady
-                inv["scrape_hash"] = scrape_hash(inv)
-                filled += 1
-    return filled
+            if not page:
+                continue
+            stats["page"] += 1
+
+            filled_extra = False
+            for key, value in (page.get("extra") or {}).items():
+                if value and not inv["extra"].get(key):
+                    inv["extra"][key] = value
+                    filled_extra = True
+            stats["extra"] += 1 if filled_extra else 0
+
+            if page.get("developer_url") and not inv.get("developer_url"):
+                inv["developer_url"] = page["developer_url"]
+                stats["developer_url"] += 1
+            if page.get("documents") and not inv.get("documents"):
+                inv["documents"] = page["documents"]
+                stats["documents"] += 1
+            if page.get("zasady"):
+                inv["zasady_wspolpracy"] = page["zasady"]
+                stats["zasady"] += 1
+            for key in ("email", "phone"):
+                val = (page.get("contact") or {}).get(key)
+                if val and not inv["contact"].get(key):
+                    inv["contact"][key] = val
+                    stats["contact"] += 1
+            if page.get("last_change"):
+                inv["last_updated_expro"] = page["last_change"]
+                stats["last_change"] += 1
+            # Useful to the open-data work: when ExPro last synced this
+            # investment with dane.gov.pl, and when the developer last
+            # published prices there.
+            inv["danegov_sync"] = page.get("danegov_sync", "")
+            inv["danegov_price_update"] = page.get("danegov_price_update", "")
+
+            inv["scrape_hash"] = scrape_hash(inv)
+    return stats
 
 # ---------------------------------------------------------------------------
 # Hash (same logic as old scraper for change detection)
@@ -580,7 +733,11 @@ def scrape_hash(inv: dict) -> str:
     key = json.dumps(
         {k: inv.get(k) for k in
          ["name", "price_from_raw", "delivery", "units_count",
-          "units_available", "zasady_wspolpracy"]},
+          "units_available", "zasady_wspolpracy",
+          # Added with the HTML pass: without them a developer publishing a
+          # website, a new document or a changed lift answer would never
+          # reach WordPress, because wp_sync skips on an unchanged hash.
+          "extra", "developer_url", "documents"]},
         ensure_ascii=False, sort_keys=True,
     )
     return hashlib.md5(key.encode()).hexdigest()
@@ -770,7 +927,7 @@ def build_investment(
         "contact":        contact,
         "units":          units,
         "documents":      [],          # not in API; wp_sync.py guards with `if documents:`
-        "zasady_wspolpracy": {},       # filled by fill_zasady_concurrent() (HTML pass)
+        "zasady_wspolpracy": {},       # filled by fill_from_html_concurrent() (HTML pass)
         "last_updated_expro": api_inv.get("creation_date", ""),
         # ── Bonus fields (new, not from old scraper) ────────────────────
         "expro_uuid":     inv_uuid,
@@ -916,9 +1073,13 @@ def main() -> None:
             time.sleep(DELAY)
 
     # Commission terms — separate HTML pass, needs the web session
-    log("Fetching zasady współpracy (commission terms) …")
-    filled = fill_zasady_concurrent(session, results)
-    log(f"  commission terms: {filled}/{len(results)} investments")
+    log("Reading investment detail pages (fields the API does not carry) …")
+    st = fill_from_html_concurrent(session, results)
+    n = len(results)
+    log(f"  pages read: {st['page']}/{n}   commission terms: {st['zasady']}   "
+        f"extra filled: {st['extra']}   developer_url: {st['developer_url']}   "
+        f"documents: {st['documents']}   contacts: {st['contact']}   "
+        f"real last-change date: {st['last_change']}")
 
     # Health line for the job summary. A unit whose detail never arrived has no
     # type and no plan; it used to be silently classified as a flat and, once
