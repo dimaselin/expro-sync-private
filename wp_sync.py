@@ -295,6 +295,39 @@ def update_meta(ssh: SSHClient, post_id: int, key: str, value: str):
         ssh.run_wp_cli(f"post meta update {post_id} {shlex.quote(key)} {shlex.quote(value)}")
 
 
+def update_meta_bulk(ssh: SSHClient, post_id: int, pairs: dict) -> int:
+    """Write many meta fields for one post in a single WP-CLI call.
+
+    One call per field meant roughly forty WordPress bootstraps per
+    investment. Measured: about 90 seconds each, and — the giveaway — the same
+    90 seconds for a 3-unit investment as for a 161-unit one, so the cost was
+    round trips rather than payload. Batched, the whole run drops from hours to
+    minutes, and the daily cron benefits identically.
+    """
+    if not pairs:
+        return 0
+    data_path = f"/tmp/esm_meta_{post_id}.json"
+    php_path  = f"/tmp/esm_meta_{post_id}.php"
+    php = (
+        "<?php\n"
+        f"$d = json_decode(file_get_contents('{data_path}'), true);\n"
+        "if (!is_array($d)) { echo 0; return; }\n"
+        f"foreach ($d as $k => $v) update_post_meta({post_id}, $k, (string) $v);\n"
+        "echo count($d);\n"
+    )
+    try:
+        ssh.write_remote_file(json.dumps(pairs, ensure_ascii=False), data_path)
+        ssh.write_remote_file(php, php_path)
+        ssh.run_wp_cli(f"eval-file {php_path}", timeout=180)
+        return len(pairs)
+    except Exception as e:
+        log(f"  bulk meta update failed ({len(pairs)} fields): {e}")
+        return 0
+    finally:
+        ssh.remove_remote_file(data_path)
+        ssh.remove_remote_file(php_path)
+
+
 # ---------------------------------------------------------------------------
 # Content builder
 # ---------------------------------------------------------------------------
@@ -790,22 +823,14 @@ def sync_investment(ssh: SSHClient, inv: dict) -> Tuple[str, Optional[int]]:
             ("projekt_prowizja_garaz",      (inv.get("zasady_wspolpracy") or {}).get("garaz_w_prowizji", "")),
         ]
 
-        for key, value in meta_fields:
-            if value:
-                try:
-                    update_meta(ssh, post_id, key, value)
-                except Exception as e:
-                    log(f"  Meta update failed [{key}]: {e}")
+        # Everything below goes up in one call instead of one per field.
+        bulk: dict = {k: v for k, v in meta_fields if v}
 
-        # developer URL — from ExPro (if not already set manually)
         dev_url = inv.get("developer_url", "")
         if dev_url:
-            try:
-                update_meta(ssh, post_id, "projekt_subdomain_url", dev_url)
-            except Exception as e:
-                log(f"  projekt_subdomain_url update failed: {e}")
+            bulk["projekt_subdomain_url"] = dev_url
 
-        # extra fields from #collapseMoreInfo
+        # extra fields from the investment detail page ("Więcej informacji")
         extra = inv.get("extra", {})
         ogrzewanie = extra.get("rodzaj_ogrzewania", "")
         extra_map = [
@@ -824,35 +849,23 @@ def sync_investment(ssh: SSHClient, inv: dict) -> Tuple[str, Optional[int]]:
             ("expro_parking_naziemne_cena",  extra.get("parking_naziemne_cena", "")),
             ("expro_parking_podziemne_cena", extra.get("parking_podziemne_cena", "")),
             ("expro_komorka_cena",   extra.get("komorka_cena", "")),
+            ("expro_parking_obowiazkowy",    extra.get("parking_obowiazkowy", "")),
         ]
-        for key, value in extra_map:
-            if value:
-                try:
-                    update_meta(ssh, post_id, key, value)
-                except Exception as e:
-                    log(f"  {key} update failed: {e}")
+        bulk.update({k: v for k, v in extra_map if v})
 
-        # Full investment JSON — used by page-inwestycja-mieszkania.php for $extra params
-        try:
-            update_meta(ssh, post_id, "expro_investment_json", json.dumps(inv, ensure_ascii=False))
-        except Exception as e:
-            log(f"  expro_investment_json update failed: {e}")
+        # Full investment JSON — page-inwestycja-mieszkania.php reads it for $extra
+        bulk["expro_investment_json"] = json.dumps(inv, ensure_ascii=False)
 
-        # documents from ExPro
         documents = inv.get("documents", [])
         if documents:
-            docs_json = json.dumps(documents, ensure_ascii=False)
-            try:
-                update_meta(ssh, post_id, "expro_dokumenty_json", docs_json)
-            except Exception as e:
-                log(f"  expro_dokumenty_json update failed: {e}")
+            bulk["expro_dokumenty_json"] = json.dumps(documents, ensure_ascii=False)
 
-        # JSON meta via remote file — normalize to Polish keys expected by template
-        units_json = json.dumps(normalize_units(inv.get("units", [])), ensure_ascii=False)
-        try:
-            update_meta(ssh, post_id, "expro_lokale_json", units_json)
-        except Exception as e:
-            log(f"  expro_lokale_json update failed: {e}")
+        # Units, normalised to the Polish keys the template expects
+        bulk["expro_lokale_json"] = json.dumps(
+            normalize_units(inv.get("units", [])), ensure_ascii=False
+        )
+
+        update_meta_bulk(ssh, post_id, bulk)
 
         # ── images ───────────────────────────────────────────────────────────
         images = inv.get("images", [])
