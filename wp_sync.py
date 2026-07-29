@@ -821,6 +821,21 @@ def sync_investment(ssh: SSHClient, inv: dict) -> Tuple[str, Optional[int]]:
             ("projekt_prowizja_vip",        komisja_rate(inv, "stawka_vip")),
             ("projekt_prowizja_termin_dni", komisja_rate(inv, "termin_wyplaty")),
             ("projekt_prowizja_garaz",      (inv.get("zasady_wspolpracy") or {}).get("garaz_w_prowizji", "")),
+            # ── Fields the API always sent and nothing was storing ──────────
+            # Measured over all 170 before adding these: build_year and
+            # investment_type are empty on every one, so they get no key here.
+            ("projekt_developer_id",   inv.get("developer_id", "")),
+            # Direct contract with the developer, the open dane.gov.pl registry
+            # or the VoxCrm API — which matters commercially, not technically.
+            ("projekt_zrodlo",         inv.get("source_name", "")),
+            ("projekt_liczba_condo",   inv.get("count_condo", "")),
+            ("projekt_liczba_uslug",   inv.get("count_utility", "")),
+            ("projekt_liczba_wszystkich", inv.get("count_all", "")),
+            ("projekt_rating",         inv.get("rating", "")),
+            ("projekt_waluta",         inv.get("currency", "")),
+            # The far end of the completion range; projekt_termin_oddania
+            # above keeps holding the start, which is what templates read.
+            ("projekt_termin_do",      inv.get("delivery_to", "")),
         ]
 
         # Everything below goes up in one call instead of one per field.

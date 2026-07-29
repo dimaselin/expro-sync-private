@@ -13,8 +13,10 @@ extra cost (see parse_investment_page / fill_from_html_concurrent):
   developer_url, documents, zasady_wspolpracy, contact e-mail and phone,
   the real last-change date (the API only offers creation_date), and the
   thirteen `extra.*` amenity answers that live in "Więcej informacji".
-  per-unit Phase 2  → bedrooms/bathrooms/has_balcony etc. → absent or default
-                      mieszkania_sync.py has fallbacks for all of these
+
+Per-unit balcony/terrace/garden/garage flags come from the weekly Playwright
+pass (amenity_patch.py); mieszkania_sync.py preserves whatever WordPress holds
+when they are absent.
 
 Migration note (realestate_id):
   Old scraper: numeric string e.g. "12345"
@@ -762,7 +764,13 @@ def scrape_hash(inv: dict) -> str:
           # Added with the HTML pass: without them a developer publishing a
           # website, a new document or a changed lift answer would never
           # reach WordPress, because wp_sync skips on an unchanged hash.
-          "extra", "developer_url", "documents"]},
+          "extra", "developer_url", "documents",
+          # Added with the API fields below. A field that is not in the hash
+          # is a field that never reaches WordPress: wp_sync skips any
+          # investment whose hash matches, so the first test of these wrote
+          # nothing at all.
+          "source_name", "count_all", "rating",
+          "delivery_to", "developer_id"]},
         ensure_ascii=False, sort_keys=True,
     )
     return hashlib.md5(key.encode()).hexdigest()
@@ -897,6 +905,8 @@ def build_investment(
 
         if card_path:
             card_urls.append(f"{BASE_URL}{card_path}")
+        elif detail.get("_cached_card_urls"):
+            card_urls = list(detail["_cached_card_urls"])
 
         unit: dict = {
             "name":         _s(ru.get("name")),
@@ -909,6 +919,9 @@ def build_investment(
             "floor":        _s(ru.get("floor")),
             "delivery":     _s(detail.get("completion_date")) or delivery,
             "type":         _s(detail.get("type_name")),
+            # Carried per unit because ExPro states it per unit; every value in
+            # the current feed is PLN, but nothing should assume that.
+            "currency":     _s(detail.get("currency")),
             # realestate_id is now UUID — mieszkania_sync.py handles the migration
             "realestate_id": uid,
             "plan_urls":     plan_urls,
@@ -968,6 +981,29 @@ def build_investment(
         "rooms_from":     api_inv.get("rooms_from", ""),
         "rooms_to":       api_inv.get("rooms_to", ""),
         "building_type_id": api_inv.get("building_type_id", ""),
+        # ── Fields the API always sent and nothing was reading ──────────────
+        # Measured across all 170 before adding: build_year, investment_type
+        # and investment_type_id are empty on every single one, so they are
+        # deliberately absent rather than carried as dead keys.
+        "developer_id":   _s(api_inv.get("developer_id")),
+        # Where the listing comes from: a direct contract with the developer
+        # (92), the open dane.gov.pl registry (68) or the VoxCrm API (10).
+        # That distinction is commercial, not technical.
+        "source_name":    _s(api_inv.get("source_name")),
+        "count_condo":    _s(api_inv.get("count_condo")),
+        "count_utility":  _s(api_inv.get("count_utility")),
+        "count_all":      _s(api_inv.get("count_all_realestates")),
+        # parking_space_required is deliberately absent: the same fact already
+        # arrives from the detail page as extra.parking_obowiazkowy in words,
+        # and the API's "0"/"1" reads as empty to every PHP truthiness check
+        # the templates use. One fact, one field, in the encoding that cannot
+        # be misread.
+        "rating":         _s(api_inv.get("rating")),
+        "currency":       _s(api_inv.get("currency")),
+        # The far end of the completion range. `delivery` above collapses the
+        # range to its start, which is what the templates read; this keeps the
+        # other end available without changing that.
+        "delivery_to":    _s(api_inv.get("completion_date_to")),
         # ExPro's own offer types for this investment (see REALESTATE_TYPES).
         # The classifier's most authoritative signal after a manual override.
         "expro_types":    api_inv.get("_expro_types", []),
@@ -1060,7 +1096,11 @@ def main() -> None:
                     # a plan added on ExPro's side after the first sight of a
                     # unit could never appear. An incomplete entry is simply
                     # left out, so the unit is fetched again.
-                    if not pu.get("type") or not pu.get("plan_urls"):
+                    # `currency` joins the completeness test deliberately:
+                    # entries cached before it existed carry no currency, and
+                    # without this they would keep an empty one for good. The
+                    # cost is one full re-read, once.
+                    if not pu.get("type") or not pu.get("plan_urls") or not pu.get("currency"):
                         incomplete += 1
                         continue
                     known_unit_details[uid] = {
@@ -1071,8 +1111,10 @@ def main() -> None:
                         "stage":           pu.get("stage", ""),
                         "type_name":       pu.get("type", ""),
                         "completion_date": pu.get("delivery", ""),
+                        "currency":        pu.get("currency", ""),
                         "_cached_plan_urls":  pu.get("plan_urls", []),
                         "_cached_plan_map":   pu.get("plan_url_map", {}),
+                        "_cached_card_urls":  pu.get("photo_urls", []),
                     }
             log(f"Loaded {len(known_unit_details)} cached unit details from prev scrape"
                 f" ({incomplete} incomplete → will be re-fetched).")
