@@ -151,8 +151,59 @@ class SSHClient:
 # Image import
 # ---------------------------------------------------------------------------
 
+# ExPro names every file with a 32-character hash, and that hash survives into
+# the uploaded file name whatever route the import took.
+_EXPRO_HASH_RE = re.compile(r"[0-9a-f]{32}")
+
+# hash → attachment ID, built once per run.
+_ATTACHMENT_INDEX: Optional[dict] = None
+
+
+def _load_attachment_index(ssh: SSHClient) -> dict:
+    """Index every attachment by the ExPro hash in its source URL or file name.
+
+    Matching on _source_url alone is not enough: it is empty on 6030 of the
+    10509 attachments in the library, because imports done from a local file
+    never set it. Nine of fourteen sampled gallery images went unrecognised
+    that way, so a run that touches every investment — which any change to
+    scrape_hash causes — would have re-imported most of the gallery as
+    duplicates.
+    """
+    global _ATTACHMENT_INDEX
+    if _ATTACHMENT_INDEX is not None:
+        return _ATTACHMENT_INDEX
+    php = (
+        "<?php\nglobal $wpdb;\n"
+        "$rows=$wpdb->get_results(\"SELECT post_id, meta_value FROM {$wpdb->postmeta} "
+        "WHERE meta_key IN ('_source_url','_wp_attached_file') AND meta_value<>''\");\n"
+        "foreach($rows as $r) echo $r->post_id.'|'.$r->meta_value.\"\\n\";\n"
+    )
+    index: dict = {}
+    try:
+        ssh.write_remote_file(php, "/tmp/esm_att_index.php")
+        out = ssh.run_wp_cli("eval-file /tmp/esm_att_index.php", timeout=180)
+        for line in out.splitlines():
+            pid, _, value = line.partition("|")
+            if not pid.strip().isdigit():
+                continue
+            for h in _EXPRO_HASH_RE.findall(value.lower()):
+                index.setdefault(h, int(pid))
+    except Exception as e:
+        log(f"  WARN attachment index unavailable ({e}) — dedup falls back to _source_url")
+    finally:
+        ssh.remove_remote_file("/tmp/esm_att_index.php")
+    log(f"  attachment index: {len(index)} known images")
+    _ATTACHMENT_INDEX = index
+    return index
+
+
 def check_image_exists(ssh: SSHClient, image_url: str) -> Optional[int]:
-    """Return attachment ID if image URL was already imported, else None."""
+    """Return attachment ID if this ExPro image was already imported."""
+    found = _EXPRO_HASH_RE.findall(image_url.lower())
+    if found:
+        hit = _load_attachment_index(ssh).get(found[-1])
+        if hit:
+            return hit
     try:
         wp_args = (
             f"post list --post_type=attachment "
