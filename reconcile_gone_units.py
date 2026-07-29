@@ -15,10 +15,15 @@ Reports by default; --apply moves the posts to draft. Nothing is deleted, and
 a unit that returns to the feed has its gone_at cleared by the next normalize
 run, after which --restore republishes it.
 
+--apply is the write switch for both directions; without it either mode only
+reports. --restore additionally republishes homes only, never the commercial
+premises the classifier drafts on purpose.
+
 Usage:
-    python3 reconcile_gone_units.py                 # report only
-    python3 reconcile_gone_units.py --apply         # publish -> draft
-    python3 reconcile_gone_units.py --restore       # draft -> publish for units that came back
+    python3 reconcile_gone_units.py                   # report what would be unpublished
+    python3 reconcile_gone_units.py --apply           # publish -> draft
+    python3 reconcile_gone_units.py --restore         # report what came back
+    python3 reconcile_gone_units.py --restore --apply # draft -> publish
     python3 reconcile_gone_units.py --min-age-days 3
 """
 from __future__ import annotations
@@ -60,10 +65,23 @@ def scan(ssh: SSHClient, min_age_days: int, restore: bool):
     if restore:
         cond = "u.gone_at IS NULL AND p.post_status = 'draft'"
         age = ""
+        # Being in the feed is not enough to deserve publishing. The classifier
+        # in mieszkania_sync.py drafts lokal-uzytkowy (no template of its own)
+        # and niesklasyfikowane (no signal placed it) on purpose, and those stay
+        # in the feed, so an unfiltered restore would put every one of them back
+        # on the site. Same rule as esm_rodzaj() there: homes only.
+        filter_php = """
+$rows = array_values(array_filter($rows, function ($r) {
+    foreach (wp_get_post_terms($r['ID'], 'property_type', ['fields' => 'slugs']) as $s) {
+        if ($s === 'mieszkanie' || str_starts_with($s, 'dom')) return true;
+    }
+    return false;
+}));"""
     else:
         cond = "u.gone_at IS NOT NULL AND p.post_status = 'publish'"
         # A unit missing from one run may be a blip in ExPro rather than a sale.
         age = f"AND u.gone_at < DATE_SUB(NOW(), INTERVAL {int(min_age_days)} DAY)"
+        filter_php = ""
     php = f"""<?php
 global $wpdb; $t = $wpdb->prefix . 'expro_units';
 $rows = $wpdb->get_results("
@@ -74,6 +92,7 @@ $rows = $wpdb->get_results("
     LEFT JOIN {{$wpdb->posts}} inv ON inv.ID = u.investment_post_id
     WHERE {cond} {age}
     ORDER BY u.expro_investment_id, u.unit_name", ARRAY_A);
+{filter_php}
 echo json_encode($rows, JSON_UNESCAPED_UNICODE);
 """
     return run_php(ssh, php, "scan") or []
@@ -100,8 +119,8 @@ echo json_encode(['done' => $n]);
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--apply", action="store_true", help="move the posts to draft")
-    ap.add_argument("--restore", action="store_true", help="republish units that returned to the feed")
+    ap.add_argument("--apply", action="store_true", help="write the change (without it, report only)")
+    ap.add_argument("--restore", action="store_true", help="look at units that returned to the feed instead")
     ap.add_argument("--min-age-days", type=int, default=1,
                     help="how long a unit must have been missing before acting (default 1)")
     args = ap.parse_args()
@@ -127,8 +146,8 @@ def main() -> None:
         if len(by_inv) > 20:
             log(f"  … and {len(by_inv) - 20} more investments")
 
-        if not (args.apply or args.restore):
-            log("REPORT ONLY — nothing written. Add --apply to unpublish.")
+        if not args.apply:
+            log(f"REPORT ONLY — nothing written. Add --apply to {verb}.")
             return
 
         BACKUP_DIR.mkdir(parents=True, exist_ok=True)
