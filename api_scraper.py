@@ -244,56 +244,106 @@ def fetch_type_map(token: str) -> dict[str, list[str]]:
 # Unit fetching
 # ---------------------------------------------------------------------------
 
-def fetch_units_list(token: str, inv_uuid: str) -> list[dict]:
-    """GET /api/realestate/?investment_id={uuid} — handles pagination.
+# A slice wider than any Polish flat will ever cost, in złoty. Only ever used
+# as the starting bound of the bisection below.
+_PRICE_CEILING = 30_000_000
+# Area slices, used when a price slice cannot be narrowed any further because
+# every unit in it costs exactly the same.
+_AREA_SLICES = [(0, 30), (30, 40), (40, 50), (50, 60), (60, 80), (80, 100000)]
 
-    Deduplicates by "uuid": for large investments (~100+ units) ExPro's API
-    has been observed returning the exact same page content again for
-    page=2 (confirmed byte-for-byte identical payload, same uuid) instead
-    of the next page — so pagination alone can silently double every unit.
-    Verified 2026-07-21 against Lokum PORTO (expro_id 2463): raw fetch
-    returned 200 entries for 100 real units, unit[0] and unit[100]
-    byte-identical including uuid. Dedup here guards every downstream
-    consumer (mieszkania_sync.py, single-inwestycja-mieszkania.php's
-    rendered unit table/cards) without needing a fix in each of them.
+
+def _fetch_units_page(token: str, inv_uuid: str, **filters) -> tuple[list[dict], int]:
+    """One /api/realestate/ response: its payload and the total it reports."""
+    params = {"investment_id": inv_uuid}
+    params.update(filters)
+    resp = requests.get(
+        f"{BASE_URL}/api/realestate/",
+        params=params,
+        headers=make_headers(token),
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("payload", []) or [], int(data.get("paginator", {}).get("totalItems", 0) or 0)
+
+
+def _harvest_by_price(token: str, inv_uuid: str, lo: int, hi: int,
+                      out: dict[str, dict], depth: int = 0) -> None:
+    """Collect every unit in a price range, splitting it until a slice fits.
+
+    The response is capped at 100 whatever you ask for, but a *filtered*
+    request reports the total for that filter — so a slice that reports 100 or
+    fewer is complete and can be taken whole.
     """
-    headers = make_headers(token)
-    all_units: list[dict] = []
-    seen_uuids: set[str] = set()
-    page = 1
-    while True:
-        resp = requests.get(
-            f"{BASE_URL}/api/realestate/",
-            params={"investment_id": inv_uuid, "page": page},
-            headers=headers,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        payload = data.get("payload", [])
-        if not payload:
-            break
-        new_count = 0
+    payload, total = _fetch_units_page(token, inv_uuid, price_f=lo, price_t=hi)
+    if total == 0:
+        return
+    if total <= 100 or depth >= 14:
+        if total > 100:
+            # The range has collapsed to a single price shared by more than
+            # 100 units. Cut the same slice by area instead.
+            for a_lo, a_hi in _AREA_SLICES:
+                sub, _ = _fetch_units_page(token, inv_uuid, price_f=lo, price_t=hi,
+                                           area_f=a_lo, area_t=a_hi)
+                for u in sub:
+                    if u.get("uuid"):
+                        out[u["uuid"]] = u
         for u in payload:
-            uid = u.get("uuid")
-            if uid and uid in seen_uuids:
-                continue
-            if uid:
-                seen_uuids.add(uid)
-            all_units.append(u)
-            new_count += 1
-        if new_count == 0:
-            # This page added nothing we hadn't already seen — either we're
-            # truly done, or the API is repeating a page (the bug this
-            # function guards against). Either way, stop: if totalItems is
-            # ALSO inflated by the same duplication, len(all_units) would
-            # never reach it and this would otherwise loop forever.
-            break
-        paginator = data.get("paginator", {})
-        total = int(paginator.get("totalItems", 0))
-        if len(all_units) >= total:
-            break
-        page += 1
+            if u.get("uuid"):
+                out[u["uuid"]] = u
+        return
+    mid = (lo + hi) // 2
+    if mid <= lo or mid >= hi:
+        for u in payload:
+            if u.get("uuid"):
+                out[u["uuid"]] = u
+        return
+    _harvest_by_price(token, inv_uuid, lo, mid, out, depth + 1)
+    _harvest_by_price(token, inv_uuid, mid + 1, hi, out, depth + 1)
+
+
+def fetch_units_list(token: str, inv_uuid: str) -> list[dict]:
+    """Every unit of an investment, not just the first hundred.
+
+    `page` is dead: the server answers page=2 with page=1's body and reports
+    currentPage=1 no matter what, so pagination silently caps every investment
+    at 100 units — 1333 of 5696 were unreachable, 20 investments truncated,
+    Quorum Tower showing 100 of 349.
+
+    The filters, however, work. They are simply not called what every previous
+    attempt assumed: the response carries its own `form.elements` listing the
+    names the server actually accepts — price_f, price_t, area_f, area_t,
+    rooms_f, rooms_t, floor_f, floor_t. Earlier probes sent price_from, limit,
+    offset, per_page and itemsPerPage, none of which appear there, so the
+    server ignored them and the cap looked absolute.
+
+    So: ask for the whole thing first, and if it does not fit, bisect the price
+    range until each slice reports 100 or fewer and take those whole.
+    Verified 2026-07-28 across all 20 oversized investments — 3333 of 3333
+    units, at 11-21 requests each. Investments that already fit (150 of 170)
+    still cost exactly one request.
+
+    Dedup by uuid is kept throughout: slices overlap at their boundaries, and
+    separately ExPro has been seen returning page 1's content twice for a
+    single unfiltered request (Lokum PORTO, 2026-07-21 — 200 entries for 100
+    real units, byte-identical including uuid).
+    """
+    payload, total = _fetch_units_page(token, inv_uuid, page=1)
+    if total <= 100:
+        out: dict[str, dict] = {}
+        for u in payload:
+            if u.get("uuid"):
+                out[u["uuid"]] = u
+        return list(out.values())
+
+    harvested: dict[str, dict] = {}
+    for u in payload:
+        if u.get("uuid"):
+            harvested[u["uuid"]] = u
+    _harvest_by_price(token, inv_uuid, 0, _PRICE_CEILING, harvested)
+    if len(harvested) < total:
+        log(f"  WARN units: collected {len(harvested)} of {total} — some slice is still short")
+    return list(harvested.values())
     return all_units
 
 # UUIDs whose detail could not be fetched this run, after all retries. A unit
