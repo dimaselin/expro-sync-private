@@ -180,6 +180,67 @@ def fetch_all_investments(token: str) -> list[dict]:
     return filtered
 
 # ---------------------------------------------------------------------------
+# ExPro's own offer-type dictionary
+# ---------------------------------------------------------------------------
+# Declared by the API itself in form.elements.realestate_type_id on
+# /api/investment/, and usable as a filter there. Nine requests classify the
+# whole catalogue from the source, which beats guessing the type from a free
+# text label with strpos: that guess defaults to "Mieszkanie" whenever nothing
+# matches, and 224 units are flats today only because no pattern hit them.
+REALESTATE_TYPES: dict[int, str] = {
+    1:  "Mieszkanie",
+    7:  "Lokal użytkowy",
+    8:  "Dom",
+    9:  "Nieruchomość inwestycyjna",
+    10: "Wykończenie",
+    11: "Apartament inwestycyjny",
+    12: "Segment",
+    13: "Firmy budowlane/Domy modułowe",
+    14: "Zarządzanie najmem",
+}
+
+
+def fetch_type_map(token: str) -> dict[str, list[str]]:
+    """investment id → the ExPro offer types it is filed under.
+
+    An investment can appear under several (mixed developments genuinely do),
+    so the value is a list. Failures are logged and skipped rather than
+    aborting: a missing entry means the classifier falls back to its other
+    signals, which is far better than no scrape at all.
+    """
+    headers = make_headers(token)
+    out: dict[str, list[str]] = {}
+    for type_id, label in REALESTATE_TYPES.items():
+        found = 0
+        page = 1
+        while True:
+            try:
+                resp = requests.get(
+                    f"{BASE_URL}/api/investment/",
+                    params={"realestate_type_id": type_id, "page": page},
+                    headers=headers,
+                    timeout=20,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                log(f"  WARN type map {label}: {e}")
+                break
+            payload = data.get("payload", [])
+            if not payload:
+                break
+            for i in payload:
+                out.setdefault(str(i.get("id")), []).append(label)
+                found += 1
+            total = int(data.get("paginator", {}).get("totalItems", 0) or 0)
+            if found >= total:
+                break
+            page += 1
+        log(f"  type map: {label:<32} {found}")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Unit fetching
 # ---------------------------------------------------------------------------
 
@@ -675,6 +736,9 @@ def build_investment(
         "rooms_from":     api_inv.get("rooms_from", ""),
         "rooms_to":       api_inv.get("rooms_to", ""),
         "building_type_id": api_inv.get("building_type_id", ""),
+        # ExPro's own offer types for this investment (see REALESTATE_TYPES).
+        # The classifier's most authoritative signal after a manual override.
+        "expro_types":    api_inv.get("_expro_types", []),
         # ── Hash ────────────────────────────────────────────────────────
         "scrape_hash":    "",
     }
@@ -720,6 +784,20 @@ def main() -> None:
         if not investments:
             log("ERROR: none of the test IDs found in filtered list.")
             sys.exit(1)
+
+    # ExPro's own classification, straight from the source rather than guessed
+    # from a label. Attached to each investment so build_investment carries it
+    # into the JSON without changing its signature.
+    log("Fetching ExPro offer-type map …")
+    try:
+        type_map = fetch_type_map(token)
+    except Exception as e:
+        log(f"WARNING: type map unavailable ({e}) — classifier falls back to its other signals")
+        type_map = {}
+    for api_inv in investments:
+        api_inv["_expro_types"] = type_map.get(str(api_inv.get("id")), [])
+    untyped = sum(1 for i in investments if not i["_expro_types"])
+    log(f"  offer types resolved for {len(investments) - untyped}/{len(investments)} investments")
 
     # Load previous scrape for unit detail cache (speed up repeat runs)
     known_unit_details: dict[str, dict] = {}
