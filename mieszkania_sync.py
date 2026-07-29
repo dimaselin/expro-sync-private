@@ -891,6 +891,11 @@ def sync_units(ssh: SSHClient, inv: dict, parent_id: int, projekt_term_id: int) 
             # ExPro's own filing for this investment — the classifier's
             # fallback for units that report no type of their own.
             'expro_types': inv.get('expro_types', []),
+            # How ExPro classifies the building itself. Needed by the
+            # house-profile check; without it that check reads a missing key,
+            # silently answers "not a house" for everything, and the promotion
+            # never happens at all.
+            'building_type_id': str(inv.get('building_type_id') or ''),
             # Escape hatch for an investment ExPro has plainly mislabelled.
             # Empty by design: an entry here is a claim we have checked.
             'type_override': _UNIT_TYPE_OVERRIDES.get(
