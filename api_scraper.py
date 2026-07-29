@@ -235,18 +235,36 @@ def fetch_units_list(token: str, inv_uuid: str) -> list[dict]:
         page += 1
     return all_units
 
-def fetch_unit_detail(token: str, unit_uuid: str) -> Optional[dict]:
-    """GET /api/realestate/{uuid}/ → payload with files, type_name, stage, completion_date."""
-    try:
-        resp = requests.get(
-            f"{BASE_URL}/api/realestate/{unit_uuid}/",
-            headers=make_headers(token),
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            return resp.json().get("payload") or {}
-    except Exception as e:
-        log(f"  WARN unit detail {unit_uuid[:8]}: {e}")
+# UUIDs whose detail could not be fetched this run, after all retries. A unit
+# without its detail has no type_name and no floor plan, and until the cache
+# stopped storing incomplete entries that gap was permanent — so the count has
+# to be visible rather than one WARN line among thousands.
+_DETAIL_FAILURES: list[str] = []
+
+def fetch_unit_detail(token: str, unit_uuid: str, attempts: int = 3) -> Optional[dict]:
+    """GET /api/realestate/{uuid}/ → payload with files, type_name, stage, completion_date.
+
+    Retried: this ran as a single 10-second attempt across 8 threads, and every
+    dropped response produced a unit with an empty type that the previous run's
+    cache then preserved for good. 84 units were sitting in that hole.
+    """
+    last = ""
+    for n in range(attempts):
+        try:
+            resp = requests.get(
+                f"{BASE_URL}/api/realestate/{unit_uuid}/",
+                headers=make_headers(token),
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                return resp.json().get("payload") or {}
+            last = f"HTTP {resp.status_code}"
+        except Exception as e:
+            last = str(e)
+        if n < attempts - 1:
+            time.sleep(0.4 * (n + 1))
+    log(f"  WARN unit detail {unit_uuid[:8]} failed after {attempts} tries: {last}")
+    _DETAIL_FAILURES.append(unit_uuid)
     return None
 
 def fetch_unit_details_concurrent(
@@ -706,25 +724,48 @@ def main() -> None:
     # Load previous scrape for unit detail cache (speed up repeat runs)
     known_unit_details: dict[str, dict] = {}
     prev_path = Path("data/expro_prev.json")
-    if prev_path.exists():
+    # Even a complete cached entry is only as fresh as the day it was first
+    # seen — if ExPro replaces a unit's floor plan or corrects its type, a
+    # cached unit never notices. EXPRO_IGNORE_CACHE=1 forces a full re-read of
+    # every unit detail; worth running periodically, and the workflow cache is
+    # restored with a rolling key so nothing else expires it.
+    ignore_cache = os.environ.get("EXPRO_IGNORE_CACHE", "").strip().lower() in ("1", "true", "yes")
+    if ignore_cache:
+        log("EXPRO_IGNORE_CACHE set — re-fetching every unit detail.")
+    if prev_path.exists() and not ignore_cache:
         try:
             prev_data = json.loads(prev_path.read_text("utf-8"))
+            incomplete = 0
             for prev_inv in prev_data:
                 for pu in prev_inv.get("units", []):
                     uid = pu.get("realestate_id", "")
-                    if uid and "-" in uid:  # UUID format only (new api_scraper output)
-                        known_unit_details[uid] = {
-                            "files": {
-                                "plan": "",   # URL cached in plan_urls below
-                                "card": "",
-                            },
-                            "stage":           pu.get("stage", ""),
-                            "type_name":       pu.get("type", ""),
-                            "completion_date": pu.get("delivery", ""),
-                            "_cached_plan_urls":  pu.get("plan_urls", []),
-                            "_cached_plan_map":   pu.get("plan_url_map", {}),
-                        }
-            log(f"Loaded {len(known_unit_details)} cached unit details from prev scrape.")
+                    if not uid or "-" not in uid:   # UUID format only (new api_scraper output)
+                        continue
+                    # Only a complete entry earns a place in the cache. This
+                    # used to store whatever the previous run ended up with,
+                    # including the empty type and empty plan left by a dropped
+                    # detail response — and since a cached unit is never
+                    # re-fetched, that gap became permanent. 84 units had no
+                    # type at all and were classified as flats by default, and
+                    # a plan added on ExPro's side after the first sight of a
+                    # unit could never appear. An incomplete entry is simply
+                    # left out, so the unit is fetched again.
+                    if not pu.get("type") or not pu.get("plan_urls"):
+                        incomplete += 1
+                        continue
+                    known_unit_details[uid] = {
+                        "files": {
+                            "plan": "",   # URL cached in plan_urls below
+                            "card": "",
+                        },
+                        "stage":           pu.get("stage", ""),
+                        "type_name":       pu.get("type", ""),
+                        "completion_date": pu.get("delivery", ""),
+                        "_cached_plan_urls":  pu.get("plan_urls", []),
+                        "_cached_plan_map":   pu.get("plan_url_map", {}),
+                    }
+            log(f"Loaded {len(known_unit_details)} cached unit details from prev scrape"
+                f" ({incomplete} incomplete → will be re-fetched).")
         except Exception as e:
             log(f"WARNING: could not load prev data — {e}")
 
@@ -750,6 +791,19 @@ def main() -> None:
     log("Fetching zasady współpracy (commission terms) …")
     filled = fill_zasady_concurrent(session, results)
     log(f"  commission terms: {filled}/{len(results)} investments")
+
+    # Health line for the job summary. A unit whose detail never arrived has no
+    # type and no plan; it used to be silently classified as a flat and, once
+    # cached, stayed that way. Empty types are counted from the result itself,
+    # so a regression anywhere upstream shows here too.
+    typeless = sum(1 for inv in results for u in inv["units"] if not u.get("type"))
+    planless = sum(1 for inv in results for u in inv["units"] if not u.get("plan_urls"))
+    total_units = sum(len(inv["units"]) for inv in results)
+    log(f"  unit details: {len(_DETAIL_FAILURES)} failed after retries; "
+        f"{typeless}/{total_units} units without a type, {planless} without a plan")
+    if typeless:
+        log("  WARNING: units without a type are classified by default — "
+            "check the failures above before trusting projekt_typ")
 
     # Save
     out_path = Path(DATA_FILE)

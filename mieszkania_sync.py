@@ -560,10 +560,19 @@ foreach ($units as $u) {
             $file_array = ['name' => basename($plan_server_map[$plan_url]), 'tmp_name' => $tmp];
             $plan_att_new = media_handle_sideload($file_array, $post_id);
             if (!is_wp_error($plan_att_new)) { $plan_att = $plan_att_new; }
-        } else {
-            $plan_att_new = media_sideload_image($plan_url, $post_id, null, 'id');
-            if (!is_wp_error($plan_att_new)) { $plan_att = $plan_att_new; }
         }
+        // There used to be a third branch here: media_sideload_image($plan_url),
+        // which downloads the file straight from ExPro onto the WP server. It
+        // runs whenever no redacted local copy is available — a plan whose
+        // download failed during the scrape, or any run without the OCR stack —
+        // and it bypasses the redactor completely, publishing plans with the
+        // developer's name and the sales office's phone number still legible.
+        // The rule is now absolute: nothing enters the media library without
+        // passing plan_redactor. The URL is recorded below instead, and the
+        // plan is picked up on a later run once a redacted copy exists.
+        // Measured before removal: 0 of 7015 units currently reach this path
+        // (5422 have a local file, 1593 are ExPro's logo placeholder), so no
+        // plan is lost today.
         if ($plan_att) {
             update_post_meta($plan_att, '_source_url',              $plan_url);
             update_post_meta($post_id,  'lokal_plan_attachment_id', (string)$plan_att);
@@ -739,12 +748,12 @@ def sync_units(ssh: SSHClient, inv: dict, parent_id: int, projekt_term_id: int) 
     upload_unit_images(ssh, units, extra_terms=[inv.get('developer', ''), inv.get('name', '')])
 
     if redact_plan_image is None:
-        # Not uploading the plan files is not enough on its own: with no entry
-        # in plan_server_map the PHP falls through to media_sideload_image(),
-        # which pulls the untouched original straight off ExPro onto the WP
-        # server — the opposite of skipping. Blank the plan URLs out of the
-        # payload so the plan block is skipped entirely. Units that already
-        # have lokal_plan_attachment_id keep the plan they have.
+        # Belt and braces. The PHP no longer has a branch that downloads the
+        # plan straight from ExPro, so an unredacted file cannot reach the
+        # media library either way — but sending plan URLs we have deliberately
+        # not prepared only invites lokal_plan_url_expro to be filled with work
+        # this run cannot do. Blank them; units that already have
+        # lokal_plan_attachment_id keep the plan they have.
         payload['units'] = [
             {**u, 'plan_urls': [], 'plan_url_map': {}, 'plan_server_map': {}}
             for u in payload['units']
