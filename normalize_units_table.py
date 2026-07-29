@@ -82,10 +82,19 @@ global $wpdb;
 $expro_ids = [{ids_csv}];
 $placeholders = implode(',', array_fill(0, count($expro_ids), '%s'));
 $sql = $wpdb->prepare(
-    "SELECT p.ID, p.post_title, pm.meta_value AS expro_id
+    "SELECT p.ID, p.post_title, p.post_status, pm.meta_value AS expro_id,
+            uid.meta_value  AS unit_uuid,
+            typ.meta_value  AS typ_slug,
+            zrd.meta_value  AS typ_zrodlo,
+            pln.meta_value  AS plan_att
      FROM {{$wpdb->posts}} p
      JOIN {{$wpdb->postmeta}} pm ON pm.post_id = p.ID AND pm.meta_key = 'expro_id'
-     WHERE p.post_type = 'property' AND p.post_status = 'publish' AND pm.meta_value IN ($placeholders)",
+     LEFT JOIN {{$wpdb->postmeta}} uid ON uid.post_id = p.ID AND uid.meta_key = 'expro_unit_id'
+     LEFT JOIN {{$wpdb->postmeta}} typ ON typ.post_id = p.ID AND typ.meta_key = 'lokal_typ_slug'
+     LEFT JOIN {{$wpdb->postmeta}} zrd ON zrd.post_id = p.ID AND zrd.meta_key = 'lokal_typ_zrodlo'
+     LEFT JOIN {{$wpdb->postmeta}} pln ON pln.post_id = p.ID AND pln.meta_key = 'lokal_plan_attachment_id'
+     WHERE p.post_type = 'property' AND p.post_status IN ('publish','draft')
+       AND pm.meta_value IN ($placeholders)",
     $expro_ids
 );
 $rows = $wpdb->get_results($sql, ARRAY_A);
@@ -98,11 +107,16 @@ echo json_encode($rows);
 
 def build_rows(investments: list, properties: list) -> list:
     # property_post_id lookup: (expro_id, unit_name_prefix) -> post_id
+    # Two indexes: the UUID is exact and is what ExPro itself uses, the title
+    # prefix is the fallback for posts that predate the UUID migration.
+    prop_by_uuid = {}
     prop_by_key = {}
     for p in properties:
+        if p.get("unit_uuid"):
+            prop_by_uuid[p["unit_uuid"]] = p
         title = p["post_title"] or ""
         prefix = title.split(" — ")[0].strip() if " — " in title else title.strip()
-        prop_by_key[(p["expro_id"], prefix)] = int(p["ID"])
+        prop_by_key[(p["expro_id"], prefix)] = p
 
     rows = []
     unmatched = 0
@@ -122,7 +136,9 @@ def build_rows(investments: list, properties: list) -> list:
             name = u.get("Nazwa") or ""
             if not name:
                 continue
-            prop_id = prop_by_key.get((eid, name))
+            uuid = u.get("realestate_id") or ""
+            prop = prop_by_uuid.get(uuid) or prop_by_key.get((eid, name))
+            prop_id = int(prop["ID"]) if prop else None
             if prop_id is None:
                 unmatched += 1
             rows.append({
@@ -130,6 +146,11 @@ def build_rows(investments: list, properties: list) -> list:
                 "property_post_id": prop_id,
                 "expro_investment_id": eid,
                 "unit_name": name,
+                "expro_unit_uuid": uuid or None,
+                "currency": u.get("currency") or None,
+                "typ_slug": (prop or {}).get("typ_slug") or None,
+                "typ_zrodlo": (prop or {}).get("typ_zrodlo") or None,
+                "plan_attachment_id": int(prop["plan_att"]) if prop and (prop.get("plan_att") or "").isdigit() else None,
                 "status": u.get("Status") or None,
                 "unit_type": u.get("Typ") or None,
                 "price_raw": u.get("Cena") or None,
@@ -145,6 +166,55 @@ def build_rows(investments: list, properties: list) -> list:
                 "raw_json": json.dumps(u, ensure_ascii=False),
             })
     return rows, unmatched
+
+
+# Columns added after the table was first built. Kept as an explicit list so a
+# fresh install and an existing one converge on the same shape, and so this can
+# run on every sync without a separate migration step.
+_NEW_COLUMNS = {
+    # ExPro's own unit identity. Matching property posts by the prefix of their
+    # title was the only option when the table was written; the UUID is exact,
+    # and every property post has carried it since the API migration.
+    "expro_unit_uuid":    "varchar(64) DEFAULT NULL",
+    "currency":           "varchar(8) DEFAULT NULL",
+    "plan_attachment_id": "bigint(20) unsigned DEFAULT NULL",
+    # What the classifier decided and which signal decided it, so a wrong type
+    # can be traced without re-deriving it.
+    "typ_slug":           "varchar(32) DEFAULT NULL",
+    "typ_zrodlo":         "varchar(32) DEFAULT NULL",
+    # Lifecycle. ExPro simply stops listing a unit when it sells — there is no
+    # "sold" status in the feed — so disappearance is the only signal there is,
+    # and it has to be recorded rather than inferred later.
+    "first_seen_at":      "datetime DEFAULT NULL",
+    "last_seen_at":       "datetime DEFAULT NULL",
+    "gone_at":            "datetime DEFAULT NULL",
+}
+
+
+def ensure_schema(ssh: SSHClient) -> None:
+    """Add any missing column. Safe to run every time."""
+    php = """<?php
+global $wpdb; $t = $wpdb->prefix . 'expro_units';
+$have = [];
+foreach ($wpdb->get_results("SHOW COLUMNS FROM {$t}") as $c) $have[] = $c->Field;
+echo json_encode($have);
+"""
+    ssh.write_remote_file(php, "/tmp/esm_norm_cols.php")
+    have = set(json.loads(ssh.run_wp_cli("eval-file /tmp/esm_norm_cols.php", timeout=60)))
+    missing = {c: d for c, d in _NEW_COLUMNS.items() if c not in have}
+    if not missing:
+        return
+    adds = ", ".join(f"ADD COLUMN `{c}` {d}" for c, d in missing.items())
+    php_alter = (
+        "<?php\nglobal $wpdb; $t = $wpdb->prefix . 'expro_units';\n"
+        f"$wpdb->query(\"ALTER TABLE {{$t}} {adds}\");\n"
+        "$wpdb->query(\"ALTER TABLE {$t} ADD INDEX idx_unit_uuid (expro_unit_uuid)\");\n"
+        "$wpdb->query(\"ALTER TABLE {$t} ADD INDEX idx_gone (gone_at)\");\n"
+        "echo $wpdb->last_error ?: 'OK';\n"
+    )
+    ssh.write_remote_file(php_alter, "/tmp/esm_norm_alter.php")
+    log(f"  schema: adding {len(missing)} column(s) — {', '.join(missing)}")
+    log(f"  {ssh.run_wp_cli('eval-file /tmp/esm_norm_alter.php', timeout=120).strip()}")
 
 
 # Static PHP script (data-independent — no string templating of row content,
@@ -165,13 +235,17 @@ if (!is_array($rows)) {
 // silently casts to 0 in a numeric column — turning "no data" into a fake
 // zero price/area/rooms. That distinction matters here (a real 0 could be
 // misread as "free apartment"), so these columns never go through %s.
-$numeric_cols = ['investment_post_id', 'property_post_id', 'price', 'price_per_m2', 'area', 'rooms'];
+$numeric_cols = ['investment_post_id', 'property_post_id', 'price', 'price_per_m2', 'area', 'rooms',
+                 'plan_attachment_id'];
 $str_cols = ['expro_investment_id', 'unit_name', 'status', 'unit_type', 'price_raw',
-             'price_per_m2_raw', 'area_raw', 'floor', 'delivery_date', 'stage', 'raw_json', 'synced_at'];
+             'price_per_m2_raw', 'area_raw', 'floor', 'delivery_date', 'stage', 'raw_json', 'synced_at',
+             'expro_unit_uuid', 'currency', 'typ_slug', 'typ_zrodlo', 'first_seen_at', 'last_seen_at'];
 $all_cols = array_merge($numeric_cols, $str_cols);
 $col_list = implode(', ', $all_cols);
 $update_list = implode(', ', array_map(function ($c) { return "$c=VALUES($c)"; },
-    array_diff($all_cols, ['expro_investment_id', 'unit_name'])));
+    array_diff($all_cols, ['expro_investment_id', 'unit_name', 'first_seen_at'])));
+// first_seen_at is written once, on insert, and never touched again — it is
+// the day the unit appeared, not the day we last looked at it.
 
 function esm_numeric_literal($v) {
     if ($v === null) return 'NULL';
@@ -204,7 +278,7 @@ echo "OK rows_affected={$affected}\n";
 """
 
 
-def push_rows(ssh: SSHClient, rows: list, chunk_size: int = 200):
+def push_rows(ssh: SSHClient, rows: list, chunk_size: int = 200) -> str:
     synced_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     total = len(rows)
     ssh.write_remote_file(_PUSH_ROWS_PHP, "/tmp/esm_norm_push.php")
@@ -212,9 +286,12 @@ def push_rows(ssh: SSHClient, rows: list, chunk_size: int = 200):
         chunk = rows[i:i + chunk_size]
         for r in chunk:
             r["synced_at"] = synced_at
+            r["first_seen_at"] = synced_at
+            r["last_seen_at"] = synced_at
         ssh.write_remote_file(json.dumps(chunk, ensure_ascii=False), "/tmp/esm_norm_rows.json")
         out = ssh.run_wp_cli("eval-file /tmp/esm_norm_push.php", timeout=120)
         log(f"  chunk {i}-{i+len(chunk)}/{total}: {out.strip()}")
+    return synced_at
 
 
 def reconcile(ssh: SSHClient) -> dict:
@@ -233,6 +310,40 @@ echo json_encode(compact('total','matched','investments','null_price','null_area
     return json.loads(out)
 
 
+def mark_gone(ssh: SSHClient, synced_at: str, full_run: bool) -> dict:
+    """Flag units this run did not see, and un-flag any that came back.
+
+    ExPro has no "sold" status — a unit that sells simply stops being listed,
+    which is why 467 units sit published on the site with data frozen at the
+    day they vanished. Disappearance is the only signal available, so it is
+    recorded here rather than guessed at later. Nothing is deleted: gone_at is
+    a date, and a unit that reappears has it cleared.
+
+    Only a full run may mark anything. A partial run sees a handful of
+    investments by design, and would otherwise declare the entire rest of the
+    catalogue gone.
+    """
+    if not full_run:
+        return {"skipped": "partial run — gone_at only updated on --all"}
+    php = f"""<?php
+global $wpdb; $t = $wpdb->prefix . 'expro_units';
+$seen = '{synced_at}';
+$newly = $wpdb->query($wpdb->prepare(
+    "UPDATE {{$t}} SET gone_at = %s WHERE gone_at IS NULL AND (last_seen_at IS NULL OR last_seen_at < %s)",
+    $seen, $seen));
+$back = $wpdb->query($wpdb->prepare(
+    "UPDATE {{$t}} SET gone_at = NULL WHERE gone_at IS NOT NULL AND last_seen_at >= %s", $seen));
+$total_gone = (int)$wpdb->get_var("SELECT COUNT(*) FROM {{$t}} WHERE gone_at IS NOT NULL");
+echo json_encode(['newly_gone'=>(int)$newly, 'returned'=>(int)$back, 'gone_total'=>$total_gone]);
+"""
+    ssh.write_remote_file(php, "/tmp/esm_norm_gone.php")
+    out = ssh.run_wp_cli("eval-file /tmp/esm_norm_gone.php", timeout=180)
+    try:
+        return json.loads(out[out.find("{"):])
+    except Exception:
+        return {"error": out[:200]}
+
+
 def main():
     ap = argparse.ArgumentParser()
     g = ap.add_mutually_exclusive_group(required=True)
@@ -242,6 +353,9 @@ def main():
     args = ap.parse_args()
 
     ssh = SSHClient()
+
+    log("Ensuring table schema is current...")
+    ensure_schema(ssh)
 
     investment_ids = None
     if args.investment_ids:
@@ -271,7 +385,10 @@ def main():
         return
 
     log("Pushing rows (INSERT ... ON DUPLICATE KEY UPDATE)...")
-    push_rows(ssh, rows)
+    synced_at = push_rows(ssh, rows)
+
+    log("Marking units no longer in the feed...")
+    log(f"  {mark_gone(ssh, synced_at, full_run=bool(args.all))}")
 
     log("Reconciliation:")
     report = reconcile(ssh)

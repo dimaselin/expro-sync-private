@@ -156,6 +156,20 @@ def run_mode(mode: str) -> bool:
             return False
         log('=== Mieszkania sync complete ===')
 
+    if mode in ('all', 'normalize'):
+        # Mirrors the units into k5ew_expro_units so anything internal — the
+        # broker view, the AI concierge, a report — can query price, area,
+        # rooms and type with SQL instead of parsing JSON blobs out of
+        # postmeta. It also carries the lifecycle marks: ExPro has no "sold"
+        # status, so a unit that stops being listed is only detectable as an
+        # absence, and this is where that absence is recorded.
+        log('=== Starting units table normalize ===')
+        if not _run_script('normalize_units_table.py', ['--all']):
+            log('=== Normalize FAILED ===')
+            wp_finish(False, {}, error='normalize_units_table.py exited with error')
+            return False
+        log('=== Normalize complete ===')
+
     if mode in ('all', 'media'):
         log('=== Starting media import ===')
         if not _run_script('import_media.py', media_args):
@@ -242,8 +256,8 @@ def main() -> None:
         return
 
     mode = sys.argv[1] if len(sys.argv) > 1 else 'all'
-    if mode not in ('all', 'scrape', 'sync', 'mieszkania', 'media', 'pipeline', 'amenity', 'redact'):
-        print('Usage: python run.py [all|scrape|sync|mieszkania|media|pipeline|amenity|redact|--daemon]')
+    if mode not in ('all', 'scrape', 'sync', 'mieszkania', 'normalize', 'media', 'pipeline', 'amenity', 'redact'):
+        print('Usage: python run.py [all|scrape|sync|mieszkania|normalize|media|pipeline|amenity|redact|--daemon]')
         sys.exit(1)
 
     ok = run_mode(mode)
