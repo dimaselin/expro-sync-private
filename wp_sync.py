@@ -487,11 +487,54 @@ def komisja_rate(inv: dict, key: str) -> str:
     return str(float(m.group())).rstrip("0").rstrip(".")
 
 
-def map_status(inv: dict) -> str:
-    available = inv.get("units_available", 0)
-    if available > 0:
-        return "dostepne"
-    return "sprzedane"
+def map_status(inv: dict, delivery: str = "") -> str:
+    """How far along the building is — which is what projekt_status means.
+
+    This used to answer a different question: "dostepne" whenever any unit was
+    free, "sprzedane" otherwise. But projekt_status is an admin select whose
+    vocabulary is przedsprzedaz / w_budowie / gotowe / sprzedane, and every
+    template reads it as a construction state through a map with no "dostepne"
+    key — so it fell through to the default. Measured on the live site: 160 of
+    167 investments held "dostepne" and therefore displayed "W budowie" as a
+    constant, including the five ExPro reports as already delivered.
+
+    Sold out still wins: an investment with nothing left to sell is not
+    described by how far along the building is. Otherwise the answer comes from
+    the delivery date, parsed exactly the way _km_termin_bucket() in the
+    templates parses it, so the badge and the filters can never disagree.
+
+    An absent or unparseable date returns "", which drops the pair from the
+    bulk write — whatever a human set in the admin survives rather than being
+    overwritten with a guess.
+    """
+    if not inv.get("units_available", 0):
+        return "sprzedane"
+
+    raw = str(delivery or inv.get("delivery", "") or "").strip()
+    low = raw.lower()
+    if not raw or "brak danych" in low:
+        return ""
+    if "oddane" in low:
+        return "gotowe"
+
+    day = None
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", raw)
+    if m:
+        try:
+            day = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            day = None
+    else:
+        m = re.search(r"\b(IV|III|II|I)\s*kw(?:arta[łl]|\.)?\s*(\d{4})", raw, re.IGNORECASE)
+        if m:
+            # The quarter is only over at its end, so a Q4 date is not late
+            # until December is.
+            month = {"I": 3, "II": 6, "III": 9, "IV": 12}[m.group(1).upper()]
+            day = datetime.date(int(m.group(2)), month, 28)
+    if not day:
+        return ""
+
+    return "gotowe" if day <= datetime.date.today() else "w_budowie"
 
 
 _TYP_PATTERNS = [
@@ -786,7 +829,7 @@ def sync_investment(ssh: SSHClient, inv: dict) -> Tuple[str, Optional[int]]:
             ("projekt_pokoje",        derive_rooms(inv)),
             ("projekt_termin_oddania", delivery),
             ("projekt_liczba_lokali", str(inv.get("units_count", "") or inv.get("units_available", ""))),
-            ("projekt_status",        map_status(inv)),
+            ("projekt_status",        map_status(inv, delivery)),
             ("projekt_typ",           projekt_typ),
             # cechy 1–4 (individual keys for single-inwestycja.php)
             ("projekt_cecha_1_ikona", "dashicons-admin-home"),
