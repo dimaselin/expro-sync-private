@@ -806,15 +806,39 @@ def get_post_map(ssh: SSHClient) -> dict:
 
 
 def get_projekt_term_id(ssh: SSHClient, post_id: int) -> int:
-    """Return projekt taxonomy term ID for a given inwestycja post."""
-    php = (
-        "<?php\n"
-        f"$t=wp_get_post_terms({post_id},'projekt',['fields'=>'ids']);\n"
-        "echo(!is_wp_error($t)&&!empty($t))?$t[0]:'0';\n"
-    )
+    """The `projekt` term for an investment, creating it if it is missing.
+
+    This used to read the term off the inwestycja post, which could never work:
+    the taxonomy is registered for `property` only, so an inwestycja post can
+    hold no terms in it. The warning fired for all 167 investments, every unit
+    was synced with term 0, and the catalogue templates — which look the term up
+    by the investment's slug — fell through to the expro_lokale_json snapshot
+    for the entire catalogue.
+
+    Resolving by slug matches what those templates do, and creating on the spot
+    keeps a new investment from silently landing on the snapshot path again.
+    """
+    php = f"""<?php
+$p = get_post({post_id});
+if (!$p) {{ echo '0'; return; }}
+$term = get_term_by('slug', $p->post_name, 'projekt');
+if (!$term) {{
+    $r = wp_insert_term($p->post_title, 'projekt', ['slug' => $p->post_name]);
+    if (is_wp_error($r)) {{ echo '0'; return; }}
+    $tid = (int) $r['term_id'];
+    // A language-less term is invisible on the front end.
+    if (function_exists('pll_set_term_language') && function_exists('pll_default_language')) {{
+        pll_set_term_language($tid, pll_default_language());
+    }}
+    echo $tid;
+    return;
+}}
+echo (int) $term->term_id;
+"""
     ssh.write_remote_file(php, '/tmp/esm_getterm.php')
     out = ssh.run_wp_cli('eval-file /tmp/esm_getterm.php')
-    return int(out.strip() or '0')
+    digits = "".join(ch for ch in out if ch.isdigit())
+    return int(digits or '0')
 
 
 def upload_unit_images(ssh: SSHClient, units: list[dict], extra_terms: list = None,
