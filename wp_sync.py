@@ -507,6 +507,17 @@ def map_status(inv: dict, delivery: str = "") -> str:
     bulk write — whatever a human set in the admin survives rather than being
     overwritten with a guess.
     """
+    # "We saw no available units" and "we failed to read the unit list" arrive
+    # here as the same zero: fetch_units_list raising leaves raw_units empty and
+    # units_available at 0. count_realestates comes from the investment record
+    # itself and is not affected by that failure, so a feed that declares units
+    # while we collected none is a failed read, not a sold-out development —
+    # and claiming "Sprzedane" on a live development is the more expensive of
+    # the two mistakes. Say nothing instead.
+    declared  = int(inv.get("units_count") or 0)
+    collected = len(inv.get("units") or [])
+    if declared > 0 and collected == 0:
+        return ""
     if not inv.get("units_available", 0):
         return "sprzedane"
 
@@ -573,7 +584,11 @@ _PROJEKT_TYP_OVERRIDES: dict[str, str] = {
 # investment away from an already-known-wrong "mieszkanie" guess.
 _NAME_TYP_PATTERNS = [
     (["wille", "willa", " domy ", "domy ", "szereg", "bliźniak", "blizniak", "wolnostoj"], "dom"),
+    # "lokal"/"lokale" stays as the required prefix on purpose. Bare stems like
+    # "handlow" or "biurow" match Polish street names — Handlowa, Biurowa —
+    # and would reclassify a residential development on its address alone.
     (["lokal usług", "lokale usług", "lokal użytk", "lokale użytk",
+      "lokal biurow", "lokale biurow", "lokal handlow", "lokale handlow",
       "firma wykończ", "wykończeni", "zarządzanie najmem", "zarzadzanie najmem"], "usluga"),
 ]
 
@@ -642,7 +657,14 @@ def resolve_projekt_typ(expro_id, inv: dict) -> str:
     if override:
         return override
     heuristic = detect_projekt_typ(inv)
-    if heuristic == "mieszkanie":
+    # The name is consulted when the units said "mieszkanie" — ExPro's default
+    # for everything, including offices — and equally when they said nothing at
+    # all. An empty heuristic is what 13 commercial investments produce: their
+    # units are "Lokal użytkowy", which no unit-type pattern covers, so the one
+    # signal that does know what they are was never asked. They kept the right
+    # value only because the bulk writer drops empty strings, which is luck
+    # rather than logic.
+    if heuristic in ("", "mieszkanie"):
         by_name = detect_projekt_typ_from_name(inv)
         if by_name:
             return by_name
