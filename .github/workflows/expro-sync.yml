@@ -226,6 +226,17 @@ jobs:
             echo "| Zdjęte z publikacji | ${DRAFT:-0} |" >> $GITHUB_STEP_SUMMARY
             grep -oE "\{'newly_gone': [0-9]+, 'returned': [0-9]+, 'gone_total': [0-9]+\}" logs/sync.log | tail -1 | \
               sed -E "s/\{'newly_gone': ([0-9]+), 'returned': ([0-9]+), 'gone_total': ([0-9]+)\}/| Zniknęły z ExPro (nowe) | \1 |\n| Wróciły | \2 |\n| Zniknięte łącznie | \3 |/" >> $GITHUB_STEP_SUMMARY
+            # What reconcile actually took off the site. Marking gone_at is
+            # reversible bookkeeping; these four lines are the moment a page
+            # stops being visible, and it must never happen unannounced.
+            RUD=$(grep -oE "✓ [0-9]+ unit post\(s\) set to draft" logs/sync.log | grep -oE "[0-9]+" | paste -sd+ - | bc 2>/dev/null || echo 0)
+            RUP=$(grep -oE "✓ [0-9]+ unit post\(s\) set to publish" logs/sync.log | grep -oE "[0-9]+" | paste -sd+ - | bc 2>/dev/null || echo 0)
+            RID=$(grep -oE "✓ [0-9]+ investment\(s\) set to draft" logs/sync.log | grep -oE "[0-9]+" | paste -sd+ - | bc 2>/dev/null || echo 0)
+            RIP=$(grep -oE "✓ [0-9]+ investment\(s\) set to publish" logs/sync.log | grep -oE "[0-9]+" | paste -sd+ - | bc 2>/dev/null || echo 0)
+            echo "| Lokale zdjęte z publikacji (reconcile) | ${RUD:-0} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Lokale przywrócone | ${RUP:-0} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Inwestycje zdjęte z publikacji | ${RID:-0} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Inwestycje przywrócone | ${RIP:-0} |" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             if grep -q "WARNING: units without a type\|no signal could place\|WARN units: collected" logs/sync.log; then
               echo "> ⚠️ Ostrzeżenia w logu — sprawdź sekcję poniżej." >> $GITHUB_STEP_SUMMARY

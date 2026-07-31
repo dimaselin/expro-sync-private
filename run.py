@@ -170,6 +170,29 @@ def run_mode(mode: str) -> bool:
             return False
         log('=== Normalize complete ===')
 
+    if mode in ('all', 'reconcile'):
+        # Acts on what normalize just recorded. ExPro has no "sold" status, so
+        # a unit that sells simply stops being listed — and until this ran, its
+        # page stayed up advertising a price and an availability frozen on the
+        # day it vanished. We cannot sell what ExPro no longer lists, and we do
+        # not get paid for it either.
+        #
+        # Unpublish first, then restore: the other order republishes an
+        # investment on the strength of units that are about to be drafted in
+        # the same run, moving it twice for no reason.
+        #
+        # Nothing is deleted and nothing is irreversible — a unit back in the
+        # feed is republished by the --restore pass below, and its investment
+        # follows. The one-day grace period is what keeps a single blip in
+        # ExPro from being read as a sale.
+        for label, extra in (('unpublish', []), ('restore', ['--restore'])):
+            log(f'=== Starting reconcile ({label}) ===')
+            if not _run_script('reconcile_gone_units.py', ['--apply'] + extra):
+                log(f'=== Reconcile ({label}) FAILED ===')
+                wp_finish(False, {}, error=f'reconcile_gone_units.py ({label}) exited with error')
+                return False
+        log('=== Reconcile complete ===')
+
     if mode in ('all', 'media'):
         log('=== Starting media import ===')
         if not _run_script('import_media.py', media_args):
@@ -256,7 +279,7 @@ def main() -> None:
         return
 
     mode = sys.argv[1] if len(sys.argv) > 1 else 'all'
-    if mode not in ('all', 'scrape', 'sync', 'mieszkania', 'normalize', 'media', 'pipeline', 'amenity', 'redact'):
+    if mode not in ('all', 'scrape', 'sync', 'mieszkania', 'normalize', 'reconcile', 'media', 'pipeline', 'amenity', 'redact'):
         print('Usage: python run.py [all|scrape|sync|mieszkania|normalize|media|pipeline|amenity|redact|--daemon]')
         sys.exit(1)
 

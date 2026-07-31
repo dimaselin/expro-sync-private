@@ -15,6 +15,11 @@ Reports by default; --apply moves the posts to draft. Nothing is deleted, and
 a unit that returns to the feed has its gone_at cleared by the next normalize
 run, after which --restore republishes it.
 
+Investment pages follow their units. Unit-level reconciliation alone leaves a
+sold-out development with a live page listing zero flats, so an investment we
+have seen units for and that has none published is drafted too, and comes back
+the moment one is published again.
+
 --apply is the write switch for both directions; without it either mode only
 reports. --restore additionally republishes homes only, never the commercial
 premises the classifier drafts on purpose.
@@ -25,6 +30,7 @@ Usage:
     python3 reconcile_gone_units.py --restore         # report what came back
     python3 reconcile_gone_units.py --restore --apply # draft -> publish
     python3 reconcile_gone_units.py --min-age-days 3
+    python3 reconcile_gone_units.py --skip-investments
 """
 from __future__ import annotations
 
@@ -117,50 +123,117 @@ echo json_encode(['done' => $n]);
     return done
 
 
+def scan_investments(ssh: SSHClient, restore: bool):
+    """Investments whose page has nothing left to show, or has something again.
+
+    Unit-level reconciliation leaves the investment itself published, so a
+    sold-out development keeps a live page listing zero flats — and so does one
+    whose units are all commercial premises the classifier drafts on purpose.
+    Sixteen of them were in that state.
+
+    The guard that matters: only investments we have actually seen units for are
+    considered. Without it a freshly created investment, synced before its units
+    arrive, would be drafted on one run and republished on the next.
+    """
+    if restore:
+        cond = "p.post_status = 'draft'"
+        having = "HAVING live > 0"
+    else:
+        cond = "p.post_status = 'publish'"
+        having = "HAVING live = 0"
+    php = f"""<?php
+global $wpdb; $t = $wpdb->prefix . 'expro_units';
+$rows = $wpdb->get_results("
+    SELECT p.ID, p.post_title, COUNT(u.id) AS seen,
+           SUM(CASE WHEN q.post_status = 'publish' THEN 1 ELSE 0 END) AS live
+    FROM {{$wpdb->posts}} p
+    JOIN {{$t}} u ON u.investment_post_id = p.ID
+    LEFT JOIN {{$wpdb->posts}} q ON q.ID = u.property_post_id
+    WHERE p.post_type = 'inwestycja' AND {cond}
+    GROUP BY p.ID {having}
+    ORDER BY seen DESC", ARRAY_A);
+echo json_encode($rows, JSON_UNESCAPED_UNICODE);
+"""
+    return run_php(ssh, php, "scaninv") or []
+
+
+def reconcile_investments(ssh: SSHClient, restore: bool, apply: bool) -> None:
+    rows = scan_investments(ssh, restore)
+    verb = "republish" if restore else "unpublish"
+    if not rows:
+        log(f"  investments: nothing to {verb}.")
+        return
+    log(f"── {len(rows)} investment(s) to {verb} ──")
+    for r in rows[:15]:
+        log(f"  {str(r['post_title'])[:44]:<46} units seen {r['seen']:>4}, published {r['live']}")
+    if len(rows) > 15:
+        log(f"  … and {len(rows) - 15} more")
+    if not apply:
+        log(f"  REPORT ONLY — add --apply to {verb} these.")
+        return
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup = BACKUP_DIR / f"reconcile_inv_{stamp}.json"
+    backup.write_text(json.dumps(rows, ensure_ascii=False, indent=1), "utf-8")
+    log(f"  backup → {backup.name}")
+    target = "publish" if restore else "draft"
+    log(f"  ✓ {apply_status(ssh, [r['ID'] for r in rows], target)} investment(s) set to {target}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="write the change (without it, report only)")
     ap.add_argument("--restore", action="store_true", help="look at units that returned to the feed instead")
     ap.add_argument("--min-age-days", type=int, default=1,
                     help="how long a unit must have been missing before acting (default 1)")
+    ap.add_argument("--skip-investments", action="store_true",
+                    help="only touch unit posts, leave investment pages alone")
     args = ap.parse_args()
 
     ssh = SSHClient()
     ssh._connect()
     try:
-        rows = scan(ssh, args.min_age_days, args.restore)
-        verb = "republish" if args.restore else "unpublish"
-        if not rows:
-            log(f"Nothing to {verb}.")
-            return
-
-        by_inv: dict = {}
-        for r in rows:
-            key = f"{r['expro_investment_id']} {r.get('investment') or '?'}"
-            by_inv.setdefault(key, []).append(r)
-
-        log(f"── {len(rows)} post(s) to {verb}, across {len(by_inv)} investment(s) ──")
-        for key, items in sorted(by_inv.items(), key=lambda x: -len(x[1]))[:20]:
-            gone = items[0].get("gone_at") or ""
-            log(f"  {key[:46]:<48} {len(items):>4}   {('зникли ' + gone[:10]) if gone else ''}")
-        if len(by_inv) > 20:
-            log(f"  … and {len(by_inv) - 20} more investments")
-
-        if not args.apply:
-            log(f"REPORT ONLY — nothing written. Add --apply to {verb}.")
-            return
-
-        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup = BACKUP_DIR / f"reconcile_backup_{stamp}.json"
-        backup.write_text(json.dumps(rows, ensure_ascii=False, indent=1), "utf-8")
-        log(f"  backup → {backup.name}")
-
-        target = "publish" if args.restore else "draft"
-        log(f"  setting post_status={target} …")
-        log(f"  ✓ {apply_status(ssh, [r['ID'] for r in rows], target)} post(s) updated")
+        _reconcile_units(ssh, args)
+        # Investments follow their units: this runs whether or not any unit
+        # moved, because an investment can be left empty by a run that changed
+        # nothing itself — the classifier drafting its commercial premises, say.
+        if not args.skip_investments:
+            reconcile_investments(ssh, args.restore, args.apply)
     finally:
         ssh.close()
+
+
+def _reconcile_units(ssh: SSHClient, args) -> None:
+    rows = scan(ssh, args.min_age_days, args.restore)
+    verb = "republish" if args.restore else "unpublish"
+    if not rows:
+        log(f"  units: nothing to {verb}.")
+        return
+
+    by_inv: dict = {}
+    for r in rows:
+        key = f"{r['expro_investment_id']} {r.get('investment') or '?'}"
+        by_inv.setdefault(key, []).append(r)
+
+    log(f"── {len(rows)} unit post(s) to {verb}, across {len(by_inv)} investment(s) ──")
+    for key, items in sorted(by_inv.items(), key=lambda x: -len(x[1]))[:20]:
+        gone = items[0].get("gone_at") or ""
+        log(f"  {key[:46]:<48} {len(items):>4}   {('gone ' + gone[:10]) if gone else ''}")
+    if len(by_inv) > 20:
+        log(f"  … and {len(by_inv) - 20} more investments")
+
+    if not args.apply:
+        log(f"  REPORT ONLY — nothing written. Add --apply to {verb}.")
+        return
+
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup = BACKUP_DIR / f"reconcile_backup_{stamp}.json"
+    backup.write_text(json.dumps(rows, ensure_ascii=False, indent=1), "utf-8")
+    log(f"  backup → {backup.name}")
+
+    target = "publish" if args.restore else "draft"
+    log(f"  ✓ {apply_status(ssh, [r['ID'] for r in rows], target)} unit post(s) set to {target}")
 
 
 if __name__ == "__main__":
