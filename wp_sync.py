@@ -693,15 +693,38 @@ def build_standard_text(inv: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def find_existing_post(ssh: SSHClient, expro_id: str) -> Optional[int]:
+    """The post this investment should be written to.
+
+    Five expro_ids have two posts each — a published one carrying the units and
+    an empty draft created beside it during the runner failures in June. Taking
+    whichever row came back first meant taking the draft in all five cases, so
+    every run wrote fresh ExPro data into a page nobody can see while the live
+    one — 79 units in Legnicka Vita's case — was never updated. That is why its
+    units had no coordinates although ExPro sends them.
+
+    Published beats draft, then the lower ID, which is the older post. Both
+    parts matter: the first is what makes it correct, the second is what makes
+    it the same answer every run.
+    """
     try:
         out = ssh.run_wp_cli(
             f"post list --post_type={shlex.quote(WP['post_type'])} "
+            f"--post_status=any "
             f"--meta_key=expro_id --meta_value={shlex.quote(expro_id)} "
-            f"--fields=ID --format=csv"
+            f"--fields=ID,post_status --format=csv"
         )
-        lines = [l.strip() for l in out.splitlines() if l.strip() and l.strip() != "ID"]
-        if lines and lines[0].isdigit():
-            return int(lines[0])
+        rows = []
+        for line in out.splitlines():
+            parts = [p.strip() for p in line.strip().split(",")]
+            if len(parts) >= 2 and parts[0].isdigit():
+                rows.append((int(parts[0]), parts[1]))
+        if not rows:
+            return None
+        if len(rows) > 1:
+            log(f"  NOTE: expro_id={expro_id} has {len(rows)} posts: "
+                f"{', '.join(f'{i}({s})' for i, s in rows)}")
+        rows.sort(key=lambda r: (r[1] != "publish", r[0]))
+        return rows[0][0]
     except Exception as e:
         log(f"  find_existing_post error: {e}")
     return None
