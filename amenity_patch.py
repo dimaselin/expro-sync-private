@@ -12,6 +12,11 @@ Run:
   python3 amenity_patch.py --all
   python3 amenity_patch.py --expro-ids 7567,7563
 """
+# Signatures here use `set[int] | None`, which Python evaluates at def time
+# before 3.10. CI runs newer, so this only ever failed for anyone trying to
+# reproduce a CI failure locally — exactly when you most need to run it.
+from __future__ import annotations
+
 import argparse, json, os, re, sys, time, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -122,13 +127,24 @@ def _playwright_login(browser) -> object:
     page.goto(f"{BASE_URL}/user/login", wait_until="domcontentloaded", timeout=20_000)
     page.fill('input[name="username"]', USERNAME)
     page.fill('input[name="password"]', PASSWORD)
-    page.click('button[type="submit"]')
+    # ExPro's login form submits through <input type="submit" name="Login">.
+    # There is no <button> on that page at all, so clicking 'button[type=submit]'
+    # waited the full Playwright timeout for an element that cannot exist and
+    # the job died there — every weekly run since 2026-07-27, which is why no
+    # balcony, terrace or basement data has reached the site since.
+    page.click('input[type="submit"], button[type="submit"]', timeout=15_000)
     page.wait_for_load_state("domcontentloaded", timeout=15_000)
+    # Landing back on /user/login means the credentials or the form changed;
+    # failing here names the cause instead of letting every later page come back
+    # as an anonymous redirect and look like "the units have no amenities".
+    if "/user/login" in page.url:
+        page.close()
+        raise RuntimeError(f"ExPro login failed — still at {page.url}")
     page.close()
     return ctx
 
 
-def run(target_ids: set[int] | None = None) -> None:
+def run(target_ids: set[str] | None = None) -> None:
     DATA_DIR.mkdir(exist_ok=True)
 
     if not EXPRO_DATA.exists():
@@ -192,83 +208,90 @@ def run(target_ids: set[int] | None = None) -> None:
     cache_lock   = threading.Lock()
     scraped_ok   = 0
     found_amenity = 0
+    http_errors  = 0
     counter_lock = threading.Lock()
 
     def _save_cache() -> None:
         AMENITY_DATA.write_text(json.dumps(cache, ensure_ascii=False, indent=2))
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-
-        # Each worker gets its own authenticated context (isolated session)
-        contexts = [_playwright_login(browser) for _ in range(MAX_WORKERS)]
-        log(f"  {MAX_WORKERS} browser contexts ready")
-
-        # Round-robin context assignment per thread
-        ctx_local = threading.local()
-        ctx_idx   = 0
-        idx_lock  = threading.Lock()
-
-        def _get_ctx():
-            if not hasattr(ctx_local, "ctx"):
-                nonlocal ctx_idx
-                with idx_lock:
-                    ctx_local.ctx = contexts[ctx_idx % MAX_WORKERS]
-                    ctx_idx += 1
-            return ctx_local.ctx
-
-        def scrape_unit(task: tuple[str, str, str, int]) -> None:
-            nonlocal scraped_ok, found_amenity
-            inv_name, unit_name, uid, numeric_id = task
-            url = f"{BASE_URL}/realestate/view/realestate_id/{numeric_id}/"
-            ctx = _get_ctx()
-            tab = None
+    # One Playwright instance per worker thread, not one shared between them.
+    # The sync API binds its objects to the greenlet that created them, so a
+    # context built in the main thread and driven from a pool thread raises
+    # "cannot switch to a different thread" on the first page — which is what
+    # every unit was hitting. Each thread now owns its browser and its login,
+    # and the work is split by slice rather than queued item by item.
+    def worker(chunk: list) -> None:
+        nonlocal scraped_ok, found_amenity, http_errors
+        if not chunk:
+            return
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
             try:
-                tab = ctx.new_page()
-                tab.goto(url, wait_until="domcontentloaded", timeout=20_000)
-                pg_text = tab.inner_text("body")
-                amenities = _parse_amenities(pg_text)
-                with cache_lock:
-                    cache[uid] = amenities
-                with counter_lock:
-                    scraped_ok += 1
-                    if amenities:
-                        found_amenity += 1
-                        log(f"  ✓ [{inv_name}] {unit_name}: {amenities}")
-                    # Periodic save
-                    if scraped_ok % 100 == 0:
-                        _save_cache()
-                        log(f"  Cache saved ({scraped_ok} scraped)")
-            except PwTimeout:
-                log(f"  TIMEOUT [{inv_name}] {unit_name} ({numeric_id})")
-                with cache_lock:
-                    cache[uid] = {}
-            except Exception as e:
-                log(f"  ERR [{inv_name}] {unit_name}: {e}")
-                with cache_lock:
-                    cache[uid] = {}
-            finally:
-                if tab:
+                ctx = _playwright_login(browser)
+                for inv_name, unit_name, uid, numeric_id in chunk:
+                    url = f"{BASE_URL}/realestate/view/realestate_id/{numeric_id}/"
+                    tab = None
                     try:
-                        tab.close()
-                    except Exception:
-                        pass
+                        tab = ctx.new_page()
+                        resp = tab.goto(url, wait_until="domcontentloaded", timeout=20_000)
+                        # A 500 renders an error page, which parses to "no
+                        # amenities" and would be cached as a fact — permanently,
+                        # since cached units are never revisited. ExPro is
+                        # serving exactly that right now, so an outage must not
+                        # be allowed to write itself into the cache as an answer.
+                        status = resp.status if resp else 0
+                        if status >= 400:
+                            with counter_lock:
+                                http_errors += 1
+                            log(f"  HTTP {status} [{inv_name}] {unit_name} ({numeric_id}) — not cached")
+                            continue
+                        amenities = _parse_amenities(tab.inner_text("body"))
+                        with cache_lock:
+                            cache[uid] = amenities
+                        with counter_lock:
+                            scraped_ok += 1
+                            if amenities:
+                                found_amenity += 1
+                                log(f"  ✓ [{inv_name}] {unit_name}: {amenities}")
+                            if scraped_ok % 100 == 0:
+                                _save_cache()
+                                log(f"  Cache saved ({scraped_ok} scraped)")
+                    except PwTimeout:
+                        log(f"  TIMEOUT [{inv_name}] {unit_name} ({numeric_id})")
+                        with cache_lock:
+                            cache[uid] = {}
+                    except Exception as e:
+                        log(f"  ERR [{inv_name}] {unit_name}: {e}")
+                        with cache_lock:
+                            cache[uid] = {}
+                    finally:
+                        if tab:
+                            try:
+                                tab.close()
+                            except Exception:
+                                pass
+            finally:
+                browser.close()
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(scrape_unit, t) for t in tasks]
-            for _ in as_completed(futures):
-                pass   # exceptions are caught inside scrape_unit
-
-        for ctx in contexts:
-            try:
-                ctx.close()
-            except Exception:
-                pass
-        browser.close()
+    workers = max(1, min(MAX_WORKERS, len(tasks)))
+    chunks  = [tasks[i::workers] for i in range(workers)]
+    log(f"  {workers} browser(s), {len(tasks)} units")
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for _ in as_completed([executor.submit(worker, c) for c in chunks]):
+            pass   # per-unit exceptions are handled inside worker()
 
     _save_cache()
     log(f"\nDone. Scraped {scraped_ok} units, {found_amenity} had amenity data.")
+    if http_errors:
+        log(f"HTTP errors: {http_errors} unit page(s) refused — those were NOT cached "
+            f"and will be retried on the next run.")
     log(f"Total cache: {len(cache)} units → {AMENITY_DATA}")
+    # Nothing scraped while the source refuses every request is an outage, not
+    # a result. Exit non-zero so the workflow says so instead of reporting a
+    # green run that collected nothing.
+    if http_errors and scraped_ok == 0:
+        log("ERROR: every unit page returned an HTTP error — ExPro side, not ours.")
+        sys.exit(1)
 
 
 def main() -> None:
@@ -278,7 +301,11 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.expro_ids:
-        ids = {int(x.strip()) for x in args.expro_ids.split(",") if x.strip()}
+        # expro_id is a string in expro_data.json, so a set of ints never
+        # matched anything and --expro-ids silently selected zero units. The
+        # weekly job runs --all, which is why nobody hit it until trying to
+        # reproduce a failure on one investment.
+        ids = {x.strip() for x in args.expro_ids.split(",") if x.strip()}
         run(target_ids=ids)
     elif args.all:
         run(target_ids=None)
