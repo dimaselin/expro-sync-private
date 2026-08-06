@@ -562,17 +562,36 @@ _TYP_PATTERNS = [
 # below now also catches most of these cases generically — overrides always
 # win first, so there's no conflict in leaving them here.
 _PROJEKT_TYP_OVERRIDES: dict[str, str] = {
-    "7557": "dom",      # Wille Biskupin etap II
-    "7293": "dom",      # Wille Biskupin etap I
+    # Corrected 2026-07-29. These two were pinned to "dom" on the assumption
+    # that ExPro mislabels villas as "Mieszkanie". It does not here: both
+    # investments report Mieszkanie for every unit (46 and 26), building_type_id
+    # 1, and the per-unit classifier in mieszkania_sync.py independently resolves
+    # all 92 live units to `mieszkanie` — its own comments say "Wille Biskupin
+    # sells flats". The investment was the only thing still calling them houses,
+    # so they sat in /rynek-pierwotny/domy/ while listing flats.
+    "7557": "mieszkanie",  # Wille Biskupin etap II — 49 live units, all mieszkanie
+    "7293": "mieszkanie",  # Wille Biskupin etap I  — 31 live units, all mieszkanie
     "6703": "dom",      # Nowa Winnica etap I - szeregi 9-12
     "6001": "usluga",   # Przystań Królewiecka III - lokale usługowe
     # Found 2026-07-20 via full audit against live WP data: unit-type heuristic
     # gives a WRONG *non-empty* result for these (so the `if value:` write guard
     # doesn't protect them) and they were corrected in WP outside this pipeline —
     # without this entry the next scheduled sync silently reverts them.
-    "7108": "mieszkanie",  # Zaciszny Ołtaszyn IV — mixed unit types (2 Mieszkanie/8 Dom),
-                            # "Dom" wrongly wins as dominant; name gives no keyword clue
-                            # so detect_projekt_typ_from_name() can't fix this one.
+    # Six investments where ExPro's raw unit type says "Mieszkanie" but the
+    # per-unit classifier — which also reads building_type_id and the unit's own
+    # shape — resolves every live unit to a house. resolve_projekt_typ() works
+    # from the scrape dump and cannot see that verdict, so it would keep
+    # answering "mieszkanie" and revert the investment on every run. Verified
+    # 2026-07-29 against the live units, unanimous in each case.
+    #
+    # 7108 was previously pinned to "mieszkanie" here for the opposite reason;
+    # its 9 live units are all houses, so the entry was inverted.
+    "7108": "dom",      # Zaciszny Ołtaszyn IV      —  9 live units, all dom
+    "7336": "dom",      # Zakątek Bliż              —  8 live units, all dom
+    "5928": "dom",      # Rubinowa Park II          —  4 live units, all dom
+    "7169": "dom",      # Osiedle pod Lasem etap IV —  4 live units, all dom
+    "5264": "dom",      # Przystań Mędłów           —  3 live units, all dom
+    "6743": "dom",      # Inwestycja Malinowa       —  2 live units, all dom
 }
 
 # Secondary signal from investment NAME, used only to correct the specific
