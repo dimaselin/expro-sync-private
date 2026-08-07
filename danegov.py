@@ -9,9 +9,12 @@ dane.gov.pl → локальний кеш офіційних цін оферт �
 D4 — латка стелі 100 юнітів).
 
 Використання:
-    python3 danegov.py fetch            # каталог + найсвіжіші зрізи → data/danegov/
-    python3 danegov.py fetch --limit 20 # те саме, але на пробу
+    python3 danegov.py fetch --all      # УСІ забудовники Польщі (~1.5 год, резюмується)
+    python3 danegov.py fetch            # лише з сідзибою у Вроцлаві (дірява вибірка)
+    python3 danegov.py restale          # викинути несвіжі записи, щоб перебрати їх
+    python3 danegov.py parse            # перепарсити кеш, без перекачування
     python3 danegov.py match            # зіставити з нашими інвестиціями
+    python3 danegov.py verify           # КРОК D3: наша ціна проти офіційної
     python3 danegov.py report           # звіт по кешу і матчингу
 
 Що з чим зіставляємо:
@@ -23,6 +26,21 @@ D4 — латка стелі 100 юнітів).
 назва бренду не збігається з назвою в реєстрі (перевірено: збіг 11/19).
 Натомість адреса + перетин номерів лока́лів. Перетин номерів заразом і
 самоперевірка: якщо номери збігаються, інвестиція та сама напевно.
+
+Три уроки, здобуті боляче — не відкочувати:
+  1. Схема НЕ єдина. Широкі запасні правила («name», «id», «symbol» → номер юніта)
+     дали 21% сміттєвих записів. Тому validate_records() відкидає набори,
+     де номери повторюються / без цифр / немає жодної ціни. Менше, зате чисто.
+  2. verify успадковує якість матчингу. На medium-зіставленнях порівнюються
+     різні будинки. Тому verify працює ТІЛЬКИ по high.
+  3. Велике відхилення ≠ помилка ціни. Медіана > 25% означає «зіставлено інший
+     обʼєкт», а не «ціна не та».
+  4. НАЙВАЖЛИВІШЕ: спершу перевіряй ВІК зрізу. 44% датасетів мають найновіший
+     зріз старіший за пів року — забудовник перестав публікувати (часто після
+     консолідації SPV). Порівняння сьогоднішньої ціни з торішньою показує
+     інфляцію, а не дефект. Без гейта свіжості я «знайшов» 106 розбіжностей;
+     з гейтом їх виявилась ОДНА на 200 юнітів. Те саме стосується D4:
+     імпорт юнітів зі зрізу піврічної давнини заллє застарілий інвентар.
 """
 
 import json
@@ -183,6 +201,80 @@ def read_xlsx_bytes(data: bytes):
     return [r for r in rows if any(str(c).strip() for c in r)]
 
 
+def read_spreadsheetml(data: bytes):
+    """Excel 2003 XML (<Workbook>…<Row><Cell><Data>) → рядки, далі табличним шляхом."""
+    x = data.decode("utf8", "replace")
+    rows = []
+    for rm in re.findall(r"<Row[^>]*>(.*?)</Row>", x, re.S):
+        cells, idx = {}, 0
+        for cm in re.finditer(r"<Cell([^>]*)>(.*?)</Cell>|<Cell([^>]*)/>", rm, re.S):
+            attrs = cm.group(1) or cm.group(3) or ""
+            ix = re.search(r'ss:Index="(\d+)"', attrs)
+            if ix:
+                idx = int(ix.group(1)) - 1
+            body = cm.group(2) or ""
+            val = "".join(re.findall(r"<Data[^>]*>(.*?)</Data>", body, re.S))
+            val = re.sub(r"<[^>]+>", "", val)
+            cells[idx] = (val.replace("&lt;", "<").replace("&gt;", ">")
+                             .replace("&quot;", '"').replace("&amp;", "&").strip())
+            idx += 1
+        if cells:
+            rows.append([cells.get(i, "") for i in range(max(cells) + 1)])
+    return [r for r in rows if any(str(c).strip() for c in r)]
+
+
+def read_native_xml(data: bytes):
+    """
+    Нативний <ceny_nieruchomosci>: <meta> з даними забудовника й адресами,
+    <nieruchomosci><nieruchomosc> зі списком лока́лів.
+    Адреса інвестиції — той блок у <meta>, чий тег згадує локалізацію/інвестицію.
+    """
+    x = data.decode("utf8", "replace")
+
+    def tag(scope, name):
+        m = re.search(rf"<{name}>(.*?)</{name}>", scope, re.S)
+        return re.sub(r"<[^>]+>", "", m.group(1)).strip() if m else ""
+
+    meta = re.search(r"<meta>(.*?)</meta>", x, re.S)
+    meta = meta.group(1) if meta else ""
+    dev_name = tag(meta, "nazwa")
+    nip = re.sub(r"\D", "", tag(meta, "nip"))
+
+    inw = ""
+    for bm in re.finditer(r"<([a-z_]*(?:lokaliza|inwestyc|przedsiewz)[a-z_]*)>(.*?)</\1>", meta, re.S):
+        inw = bm.group(2)
+        break
+    if not inw:                                    # запасний варіант — адреса продажу
+        m = re.search(r"<adres_sprzedazy>(.*?)</adres_sprzedazy>", meta, re.S)
+        inw = m.group(1) if m else ""
+
+    city = tag(inw, "miejscowosc")
+    street = tag(inw, "ulica")
+    house = tag(inw, "nr_nieruchomosci") or tag(inw, "nr_lokalu")
+    postal = tag(inw, "kod_pocztowy")
+
+    recs = []
+    for um in re.finditer(r"<nieruchomosc>(.*?)</nieruchomosc>", x, re.S):
+        u = um.group(1)
+        unit = tag(u, "numer") or tag(u, "oznaczenie") or tag(u, "nr_lokalu")
+        if not unit:
+            continue
+        area = num(tag(u, "powierzchnia") or tag(u, "powierzchnia_uzytkowa"))
+        pm2 = num(tag(u, "cena_m2"))
+        price = num(tag(u, "cena"))
+        if not price and area and pm2:
+            price = round(area * pm2, 2)
+        recs.append({
+            "dev_name": dev_name, "nip": nip, "inw_name": tag(meta, "nazwa_inwestycji"),
+            "inw_city": city, "inw_street": street,
+            "inw_house": house or house_no(street), "inw_postal": postal,
+            "unit_no": unit, "area": area, "price": price, "price_m2": pm2,
+            "price_prev": 0.0, "status": tag(u, "status"),
+            "date": tag(u, "data_obowiazywania_ceny")[:10],
+        })
+    return recs
+
+
 def read_any(path: Path, fmt: str):
     """
     Повертає (kind, payload):
@@ -193,8 +285,16 @@ def read_any(path: Path, fmt: str):
     data = path.read_bytes()
     head = data[:400].lstrip()
 
-    if head[:5] == b"<?xml" and b"otwarte-dane:harvester" in data[:2000]:
-        return "skip", "xml-маніфест харвестера, не дані"
+    if head[:5] == b"<?xml" or head[:1] == b"<":
+        if b"otwarte-dane:harvester" in data[:2000]:
+            return "skip", "xml-маніфест харвестера, не дані"
+        if b"office:spreadsheet" in data[:1500] or b"<Workbook" in data[:1500]:
+            rows = read_spreadsheetml(data)
+            return ("rows", rows) if rows else ("skip", "spreadsheetml без рядків")
+        if b"<nieruchomosc" in data[:200000] or b"ceny_nieruchomosci" in data[:1000]:
+            recs = read_native_xml(data)
+            return ("recs", recs) if recs else ("skip", "xml без розпізнаних лока́лів")
+        return "skip", "xml невідомої структури"
     if head[:1] in (b"[", b"{"):
         recs = read_json_bytes(data)
         return ("recs", recs) if recs else ("skip", "json без розпізнаних юнітів")
@@ -213,9 +313,23 @@ def read_any(path: Path, fmt: str):
 # Мапінг статутних колонок
 # --------------------------------------------------------------------------- #
 
-# Кваліфікатор адреси ІНВЕСТИЦІЇ. Відмінок різний у різних забудовників:
-# «…lokalizacji przedsięwzięcia deweloperskiego» і «Lokalizacja przedsięwzięcia…».
-INW_RE = re.compile(r"lokaliza\w* przedsiewziecia")
+# Кваліфікатор адреси ІНВЕСТИЦІЇ. Написання різні: «…lokalizacji przedsięwzięcia
+# deweloperskiego», «Lokalizacja przedsięwzięcia…», «…lokalizacji inwestycji».
+INW_RE = re.compile(r"lokaliza\w* (?:przedsiewziecia|inwestycji)")
+
+# Номер лока́лю, наданий забудовником. Написань щонайменше пʼять.
+UNIT_RE = re.compile(
+    r"nadany przez dewelopera|nr lokalu dewelopera|oznaczenie lokalu|"
+    r"^identyfikator lokalu$|^nr lokalu$"
+)
+
+# Колонка-ДАТА. Мусить перевірятись ПЕРШОЮ: «Data od której obowiązuje cena lokalu»
+# містить слово «cena» і без цього чека їде в ціну.
+DATE_RE = re.compile(r"^data\b|data od ktorej|obowiazuje od|^cena obowiazuje")
+
+# «Cena lokalu (m2 * powierzchnia)» — це ПОВНА ціна, у назві якої описана формула.
+# Без цього правила вона розпізнається як ціна за метр.
+PRICE_FORMULA_RE = re.compile(r"m ?2 ?\*|\* ?m ?2|m ?2 powierzchnia|powierzchnia ?\* ?m ?2")
 
 # Колонки з цінами, які НЕ є ціною лока́лю: оздоблення, частка в ділянці,
 # паркомісце, комірка. Без цього «Wykończenie cena/m2» їде в ціну за метр.
@@ -226,9 +340,16 @@ NOT_PRICE = re.compile(
 
 # Кастомні (нестатутні) заголовки, які реально трапляються у забудовників.
 CUSTOM = {
-    "identyfikator_lokalu": "unit_no", "inwestycja": "inw_name",
-    "powierzchnia_m2": "area", "cena_brutto": "price", "cena_za_m2": "price_m2",
-    "poziom": "floor", "pokoje": "rooms",
+    # snake_case варіант
+    "identyfikator lokalu": "unit_no", "inwestycja": "inw_name",
+    "powierzchnia m2": "area", "cena brutto": "price", "cena za m2": "price_m2",
+    "cena mkw": "price_m2", "poziom": "floor", "pokoje": "rooms",
+    # мінімалістичний варіант
+    "lokal": "unit_no", "cena": "price",
+    # англомовний варіант (Value.*)
+    "value gross": "price", "value areagross": "area",
+    "value investmentname": "inw_name", "value productname": "inw_name",
+    "value date": "date",
 }
 
 
@@ -253,13 +374,18 @@ def map_columns(header):
         if n in CUSTOM:
             out.setdefault(CUSTOM[n], i)
             continue
+        # ДАТИ — першими. «Data od której obowiązuje cena lokalu» містить «cena»,
+        # і без цього чека колонка з датою розпізнається як ціна.
+        if DATE_RE.search(n):
+            out.setdefault("date", i)
+            continue
         is_inw = bool(INW_RE.search(n))
         # Ціна за метр упізнається за «m2» будь-де в назві, а не лише за «cena za m»:
         # трапляється «Cena brutto/m2 powierzchni produktu».
-        per_m2 = bool(re.search(r"\bm ?2\b", n))
+        per_m2 = bool(re.search(r"\bm ?2\b", n)) and not PRICE_FORMULA_RE.search(n)
         has_cena = "cena" in n
 
-        if "nadany przez dewelopera" in n:
+        if UNIT_RE.search(n):
             out.setdefault("unit_no", i)
         elif "nazwa dewelopera" in n:
             out.setdefault("dev_name", i)
@@ -290,9 +416,57 @@ def map_columns(header):
             out.setdefault("price_m2", i)
         elif has_cena:
             out.setdefault("price", i)
-        elif "data" in n and ("aktualizacji" in n or "obowiazuje" in n):
-            out.setdefault("date", i)
+
+    # Запасний ключ юніта — лише ВУЗЬКИЙ список. Свідомо без загальних 'id', 'name',
+    # 'symbol': вони підхоплюють колонки-прапорці й дають сміття (перевірено —
+    # 36 906 записів з номером «X» на один прогін). Краще менше, але чисто.
+    if "unit_no" not in out:
+        for i, h in enumerate(header):
+            if norm(h) in ("id nieruchomosci", "id lokalu", "numer lokalu",
+                           "nr mieszkania", "oznaczenie nieruchomosci"):
+                out["unit_no"] = i
+                break
     return out
+
+
+# Значення, які точно не є номером лока́лю.
+JUNK_UNIT = {"x", "prices", "cena", "lokal", "nazwa", "suma", "razem", "name", "id",
+             "-", "brak", "n a", "nd", "m", "st post", "lokal mieszkalny", "dom",
+             "mieszkanie", "razem suma", "total"}
+
+
+def validate_records(recs, src=""):
+    """
+    Відсіює набори, де колонка «номер юніта» насправді не номер.
+    Три сигнали, кожен сам собою достатній:
+      1. надто багато однакових значень — це прапорець, а не ідентифікатор
+      2. більшість значень без жодної цифри
+      3. жодної ціни в наборі
+    Повертає (records, причина_відкидання або None).
+    """
+    if not recs:
+        return [], "порожньо"
+
+    kept = [r for r in recs
+            if norm(r["unit_no"]) not in JUNK_UNIT and len(str(r["unit_no"]).strip()) <= 28]
+    if not kept:
+        return [], "усі номери лока́лів — сміття"
+
+    vals = [str(r["unit_no"]).strip() for r in kept]
+    uniq = len(set(vals))
+    if uniq <= 1 and len(vals) > 3:
+        return [], "номер лока́лю однаковий у всіх рядках"
+    if uniq / len(vals) < 0.6 and len(vals) > 10:
+        return [], f"номери лока́лів повторюються ({uniq} унікальних на {len(vals)})"
+
+    with_digit = sum(1 for v in vals if re.search(r"\d", v))
+    if with_digit / len(vals) < 0.5:
+        return [], "більшість номерів без цифр"
+
+    if not any(r["price"] or r["price_m2"] for r in kept):
+        return [], "жодної ціни в наборі"
+
+    return kept, None
 
 
 def read_json_bytes(data: bytes):
@@ -476,25 +650,33 @@ def cmd_fetch(limit=None, scope="city"):
             failed += 1
             continue
 
-        target = None
-        for it in ds.get("data", []):
-            if "ceny ofertowe" in norm(it["attributes"].get("title", "")):
-                target = it
-                break
-        if not target:
+        # У однієї інституції буває КІЛЬКА датасетів «Ceny ofertowe»: старий закинутий
+        # і поточний. Брати перший-ліпший не можна — саме через це половина кешу
+        # виявилась торішньою (Archicom Nieruchomości 9: ds 4971 замер на 11.09.2025,
+        # а ds 11076 живий і має 308 зрізів). Обираємо той, чий НАЙНОВІШИЙ ресурс свіжіший.
+        cands = [it for it in ds.get("data", [])
+                 if "ceny ofertowe" in norm(it["attributes"].get("title", ""))]
+        if not cands:
             empty += 1
             continue
 
-        try:
-            rs = api(f"datasets/{target['id']}/resources", per_page=100, sort="-created")
-        except Exception:
+        best, best_res, best_date = None, None, ""
+        for it in cands:
+            try:
+                rs = api(f"datasets/{it['id']}/resources", per_page=100, sort="-created")
+            except Exception:
+                continue
+            rl = sorted(rs.get("data", []),
+                        key=lambda r: (r["attributes"].get("created") or ""), reverse=True)
+            top = (rl[0]["attributes"].get("created") or "") if rl else ""
+            if top > best_date:
+                best, best_res, best_date = it, rl, top
+            time.sleep(0.05)
+        if not best:
             failed += 1
             continue
-
-        res = sorted(
-            rs.get("data", []),
-            key=lambda r: (r["attributes"].get("created") or ""), reverse=True
-        )
+        target, res = best, best_res
+        rs = {"meta": {"count": len(best_res)}}
         picked = None
         for r in res:
             a = r["attributes"]
@@ -529,6 +711,39 @@ def cmd_fetch(limit=None, scope="city"):
     cmd_parse()
 
 
+def cmd_restale(max_age=45):
+    """
+    Викидає з каталогу записи з несвіжим зрізом, щоб `fetch --all` перебрав саме їх
+    уже з виправленим вибором датасету (найсвіжіший, а не перший-ліпший).
+    Свіжі записи й їхні файли не чіпаються — обхід резюмується.
+    """
+    import datetime as _dt
+    if not CATALOG.exists():
+        print("Немає каталогу.")
+        return
+    cat = json.loads(CATALOG.read_text(encoding="utf8"))
+    now = _dt.datetime.now(_dt.timezone.utc)
+    keep, drop = [], []
+    for c in cat:
+        created = (c.get("created") or "")[:19]
+        age = None
+        if created:
+            try:
+                age = (now - _dt.datetime.fromisoformat(created).replace(
+                    tzinfo=_dt.timezone.utc)).days
+            except ValueError:
+                age = None
+        (keep if (age is not None and age <= max_age) else drop).append(c)
+
+    for c in drop:
+        p = HERE / c["file"]
+        if p.exists():
+            p.unlink()
+    CATALOG.write_text(json.dumps(keep, ensure_ascii=False, indent=1), encoding="utf8")
+    print(f"каталог: було {len(cat)} → лишилось {len(keep)} свіжих, "
+          f"викинуто {len(drop)} несвіжих (їх переберемо заново)")
+
+
 def cmd_parse(verbose=False):
     """Парсинг того, що вже в кеші. Окремо від fetch, щоб правити рідери без перекачування."""
     if not CATALOG.exists():
@@ -553,6 +768,12 @@ def cmd_parse(verbose=False):
             else:
                 recs = []
                 skipped[payload] += 1
+            if recs:
+                recs, why = validate_records(recs, p.name)
+                if why:
+                    skipped["відкинуто якістю: " + why.split("(")[0].strip()] += 1
+                    if verbose:
+                        print(f"   ~ {p.name}: {why}")
         except Exception as e:
             recs = []
             skipped[f"{type(e).__name__}"] += 1
@@ -673,6 +894,240 @@ def cmd_match():
     print(f"→ {MAP_FILE.relative_to(HERE)}")
 
 
+# --------------------------------------------------------------------------- #
+# VERIFY (крок D3) — наша ціна на сайті проти офіційно опублікованої
+# --------------------------------------------------------------------------- #
+
+OUR_UNITS = CACHE / "our_units.json"
+
+
+def fetch_our_units(refresh=False):
+    """
+    Живі ціни з сайту. Номер лока́лю лежить у post_title до « — »:
+        «A.1.1 — Elewator - Mieszkania i Lofty»
+    Кешується, бо для повторного порівняння SSH не потрібен.
+    """
+    if OUR_UNITS.exists() and not refresh:
+        return json.loads(OUR_UNITS.read_text(encoding="utf8"))
+    try:
+        import paramiko
+        from config import SSH, WP
+    except ImportError as e:
+        print(f"   ! потрібен paramiko і config.py: {e}")
+        return {}
+
+    sql = (
+        "SELECT i.meta_value AS expro_id, p.ID, p.post_title, "
+        "MAX(CASE WHEN m.meta_key='fave_property_price' THEN m.meta_value END) AS price, "
+        "MAX(CASE WHEN m.meta_key='lokal_cena_m2' THEN m.meta_value END) AS m2, "
+        "MAX(CASE WHEN m.meta_key='lokal_status_expro' THEN m.meta_value END) AS status "
+        "FROM k5ew_posts p "
+        "JOIN k5ew_postmeta m ON m.post_id = p.ID "
+        "JOIN k5ew_postmeta link ON link.post_id = p.ID AND link.meta_key='fave_property_project_id' "
+        "JOIN k5ew_postmeta i ON i.post_id = link.meta_value AND i.meta_key='expro_id' "
+        "WHERE p.post_type='property' AND p.post_status='publish' "
+        "GROUP BY p.ID"
+    )
+    cmd = f"cd {WP['path']} && wp db query \"{sql}\" --skip-column-names"
+    print("   тягну живі ціни з сайту …")
+    c = paramiko.SSHClient()
+    c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    c.connect(SSH["host"], port=SSH["port"], username=SSH["username"],
+              password=SSH["password"], timeout=45)
+    _, out, err = c.exec_command(cmd, timeout=300)
+    text = out.read().decode("utf8", "replace")
+    e = err.read().decode("utf8", "replace")
+    c.close()
+    if e.strip() and not text.strip():
+        print("   ! " + e[:200])
+        return {}
+
+    by_inv = defaultdict(dict)
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 6:
+            continue
+        expro_id, pid, title, price, m2, status = parts[:6]
+        unit = title.split("—")[0].strip() or title.strip()
+        by_inv[expro_id][unit_key(unit)] = {
+            "wp_id": int(pid), "unit_no": unit,
+            "price": num(price), "price_m2": num(m2), "status": status,
+        }
+    OUR_UNITS.parent.mkdir(parents=True, exist_ok=True)
+    OUR_UNITS.write_text(json.dumps(by_inv, ensure_ascii=False), encoding="utf8")
+    print(f"   → {sum(len(v) for v in by_inv.values())} юнітів по {len(by_inv)} інвестиціях")
+    return by_inv
+
+
+MAX_SNAPSHOT_AGE_DAYS = 45
+
+
+def cmd_verify(refresh=False, tol_pct=1.0, tol_abs=1000.0, max_age=MAX_SNAPSHOT_AGE_DAYS):
+    """
+    Порівнює нашу ціну з офіційно опублікованою по зіставлених інвестиціях.
+    Розбіжністю вважається відхилення більше за ОБИДВА пороги — щоб копійчані
+    округлення й курсові дрібниці не сипали шумом.
+
+    ⚠ ГЕЙТ СВІЖОСТІ — найважливіше в цій функції.
+    Частина забудовників перестала публікувати (напр. після консолідації SPV):
+    у їхньому датасеті найновіший зріз може бути піврічної давнини. Порівняння
+    нашої сьогоднішньої ціни з торішньою показує не дефект, а інфляцію.
+    Перевірено боляче: усі «розбіжності» першого прогону (+10% Atrium,
+    −8.8% Legnicka Vita, −9% Traugutta) виявились саме цим — зрізи були
+    з вересня-жовтня 2025. Зі свіжих зрізів розбіжностей майже немає.
+    """
+    import datetime as _dt
+    if not MAP_FILE.exists() or not PARSED.exists():
+        print("Спершу: python3 danegov.py fetch --all && python3 danegov.py match")
+        return
+    mp = json.loads(MAP_FILE.read_text(encoding="utf8"))
+    parsed = json.loads(PARSED.read_text(encoding="utf8"))
+    ours = fetch_our_units(refresh)
+    if not ours:
+        return
+
+    # реєстрові юніти згруповані так само, як у match()
+    groups = defaultdict(dict)
+    for blob in parsed.values():
+        for r in blob["records"]:
+            sk = street_key(r["inw_street"])
+            key = ((norm(r["inw_city"]), sk, house_no(r["inw_house"])) if sk
+                   else ("name", norm(r.get("inw_name")), ""))
+            groups[key][unit_key(r["unit_no"])] = r
+
+    report, suspect, stale, tot = [], [], [], defaultdict(int)
+    now = _dt.datetime.now(_dt.timezone.utc)
+    for x in mp:
+        # Тільки high. На medium перетин юнітів 1–2, і порівняння цін тоді
+        # порівнює нас із чужим будинком — перевірено на «Osiedle Zielony Zakątek»,
+        # де «офіційна ціна» 25 000 приїхала з іншої інвестиції.
+        if x.get("confidence") != "high":
+            continue
+        reg_meta = x.get("registry") or {}
+        sk = street_key(reg_meta.get("street"))
+        key = ((norm(reg_meta.get("city")), sk, house_no(reg_meta.get("house"))) if sk
+               else ("name", norm(reg_meta.get("inw_name")), ""))
+        reg = groups.get(key, {})
+        mine = ours.get(str(x["expro_id"]), {})
+        if not reg or not mine:
+            continue
+
+        # Гейт свіжості — до будь-яких порівнянь.
+        created = (reg_meta.get("created") or "")[:19]
+        age = None
+        if created:
+            try:
+                age = (now - _dt.datetime.fromisoformat(created).replace(
+                    tzinfo=_dt.timezone.utc)).days
+            except ValueError:
+                age = None
+        if age is None or age > max_age:
+            stale.append({"name": x["name"], "expro_id": x["expro_id"],
+                          "snapshot": created[:10] or "?", "age_days": age,
+                          "registry_units": x.get("registry_units")})
+            tot["stale_skipped"] += 1
+            continue
+
+        diffs, same, only_ours, only_reg = [], 0, 0, 0
+        for uk, u in mine.items():
+            r = reg.get(uk)
+            if not r:
+                only_ours += 1
+                continue
+            a, b = u["price"], r["price"]
+            if a <= 0 or b <= 0:
+                continue
+            d = a - b
+            if abs(d) > tol_abs and abs(d) / b * 100 > tol_pct:
+                diffs.append({"unit": u["unit_no"], "wp_id": u["wp_id"],
+                              "ours": a, "official": b, "delta": round(d, 2),
+                              "pct": round(d / b * 100, 2)})
+            else:
+                same += 1
+        only_reg = len([k for k in reg if k not in mine])
+
+        # Санітарна перевірка ЗІСТАВЛЕННЯ, а не цін: якщо розбігається більшість
+        # юнітів або медіанне відхилення величезне — це майже напевно не наші ціни
+        # помилкові, а зіставлено інший будинок. Такі не звітуємо як цінові дефекти.
+        compared = same + len(diffs)
+        drift = None
+        if compared >= 4 and diffs:
+            share = len(diffs) / compared
+            pcts = sorted(abs(d["pct"]) for d in diffs)
+            med = pcts[len(pcts) // 2]
+            # Порядок величини розрізняє два різні явища:
+            #   медіана > 25%  — зіставлено не той будинок (бачили 1453%)
+            #   медіана мала, але розбігається більшість — ціни справді
+            #     системно поїхали по всій інвестиції. Це НЕ шум, це знахідка.
+            if med > 25:
+                suspect.append({
+                    "name": x["name"], "expro_id": x["expro_id"],
+                    "compared": compared, "differing": len(diffs),
+                    "median_abs_pct": med,
+                    "why": "порядок цін не збігається — схоже, зіставлено інший обʼєкт",
+                    "registry": reg_meta,
+                })
+                tot["suspect_match"] += 1
+                continue
+            if share > 0.6:
+                sign = "вище" if sum(d["delta"] for d in diffs) > 0 else "нижче"
+                drift = {"share": round(share * 100), "median_pct": med, "direction": sign}
+                tot["systematic_drift"] += 1
+
+        tot["investments"] += 1
+        tot["compared"] += compared
+        tot["diff"] += len(diffs)
+        tot["only_ours"] += only_ours
+        tot["only_reg"] += only_reg
+        if diffs or only_ours:
+            report.append({
+                "name": x["name"], "expro_id": x["expro_id"],
+                "confidence": x["confidence"],
+                "compared": same + len(diffs), "identical": same,
+                "differing": len(diffs),
+                "only_on_our_site": only_ours, "only_in_registry": only_reg,
+                "systematic_drift": drift,
+                "worst": sorted(diffs, key=lambda d: -abs(d["delta"]))[:10],
+            })
+
+    out = HERE / "data" / "danegov_verify.json"
+    out.write_text(json.dumps(
+        {"generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+         "tolerance": {"pct": tol_pct, "abs": tol_abs},
+         "max_snapshot_age_days": max_age,
+         "totals": dict(tot), "investments": report,
+         "suspect_matches": suspect, "stale_snapshots": stale},
+        ensure_ascii=False, indent=1), encoding="utf8")
+
+    print(f"\n=== D3: звірка цін (зрізи не старші за {max_age} дн.) ===")
+    print(f"  інвестицій звірено : {tot['investments']}")
+    print(f"  юнітів звірено     : {tot['compared']}")
+    print(f"  ціна збігається    : {tot['compared'] - tot['diff']}")
+    print(f"  РОЗБІЖНОСТЕЙ       : {tot['diff']}")
+    print(f"  є в нас, нема в реєстрі : {tot['only_ours']}")
+    print(f"  є в реєстрі, нема в нас : {tot['only_reg']}   ← ціль D4")
+    if stale:
+        print(f"\n  ⊘ пропущено — забудовник давно не публікує: {len(stale)}")
+        for z in sorted(stale, key=lambda q: -(q['age_days'] or 0))[:8]:
+            print(f"     {z['name'][:38]:<38} зріз {z['snapshot']} ({z['age_days']} дн. тому)")
+    if suspect:
+        print(f"\n  ⚠ відкинуто як хибне ЗІСТАВЛЕННЯ (не цінова помилка): {len(suspect)}")
+        for s_ in suspect[:6]:
+            print(f"     {s_['name'][:38]:<38} {s_['differing']}/{s_['compared']} "
+                  f"розбіг, медіана {s_['median_abs_pct']:.0f}% — {s_['why']}")
+    for r in sorted(report, key=lambda z: -z["differing"])[:8]:
+        if not r["differing"]:
+            continue
+        d = r.get("systematic_drift")
+        tagline = (f"  ⇢ СИСТЕМНИЙ ЗСУВ: {d['share']}% юнітів, медіана {d['median_pct']:.1f}% "
+                   f"{d['direction']} за офіційну") if d else ""
+        print(f"\n  {r['name'][:40]} — {r['differing']} з {r['compared']}{tagline}")
+        for d in r["worst"][:3]:
+            print(f"     {d['unit']:<14} наша {d['ours']:>12,.0f} | офіційна {d['official']:>12,.0f}"
+                  f" | {d['pct']:+.1f}%".replace(",", " "))
+    print(f"\n→ {out.relative_to(HERE)}")
+
+
 def cmd_report():
     if CATALOG.exists():
         c = json.loads(CATALOG.read_text(encoding="utf8"))
@@ -699,9 +1154,13 @@ if __name__ == "__main__":
         lim = int(sys.argv[sys.argv.index("--limit") + 1])
     if cmd == "fetch":
         cmd_fetch(lim, scope="all" if "--all" in sys.argv else "city")
+    elif cmd == "restale":
+        cmd_restale()
     elif cmd == "parse":
         cmd_parse(verbose="--verbose" in sys.argv)
     elif cmd == "match":
         cmd_match()
+    elif cmd == "verify":
+        cmd_verify(refresh="--refresh" in sys.argv)
     else:
         cmd_report()
