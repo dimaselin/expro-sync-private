@@ -153,16 +153,25 @@ def read_csv_bytes(data: bytes):
 
 
 def read_xlsx_bytes(data: bytes):
-    """Мінімальний рідер XLSX без зовнішніх залежностей — лише перший аркуш."""
+    """
+    Мінімальний рідер XLSX без зовнішніх залежностей — лише перший аркуш.
+
+    ⚠ Теги можуть мати префікс простору імен: частина генераторів пише
+    `<x:row><x:c><x:v>` замість `<row><c><v>`. Без `(?:\\w+:)?` у кожному
+    регексі такі файли мовчки дають нуль рядків (так втрачалось ~90 датасетів,
+    зокрема всі SPV Lokum/Olczyk).
+    """
     try:
         z = zipfile.ZipFile(io.BytesIO(data))
     except Exception:
         return []
+    P = r"(?:\w+:)?"                       # необовʼязковий префікс ns
+
     shared = []
     if "xl/sharedStrings.xml" in z.namelist():
         xml = z.read("xl/sharedStrings.xml").decode("utf8", "replace")
-        for si in re.findall(r"<si>(.*?)</si>", xml, re.S):
-            shared.append("".join(re.findall(r"<t[^>]*>(.*?)</t>", si, re.S)))
+        for si in re.findall(rf"<{P}si>(.*?)</{P}si>", xml, re.S):
+            shared.append("".join(re.findall(rf"<{P}t[^>]*>(.*?)</{P}t>", si, re.S)))
     sheets = [n for n in z.namelist() if re.match(r"xl/worksheets/sheet\d+\.xml$", n)]
     if not sheets:
         return []
@@ -173,10 +182,10 @@ def read_xlsx_bytes(data: bytes):
                  .replace("&quot;", '"').replace("&apos;", "'").replace("&amp;", "&"))
 
     rows = []
-    for rm in re.findall(r"<row[^>]*>(.*?)</row>", xml, re.S):
+    for rm in re.findall(rf"<{P}row[^>]*>(.*?)</{P}row>", xml, re.S):
         cells = {}
         maxi = -1
-        for cm in re.finditer(r'<c([^>]*)>(.*?)</c>|<c([^>]*)/>', rm, re.S):
+        for cm in re.finditer(rf'<{P}c([^>]*?)>(.*?)</{P}c>|<{P}c([^>]*?)/>', rm, re.S):
             attrs = cm.group(1) or cm.group(3) or ""
             body = cm.group(2) or ""
             ref = re.search(r'r="([A-Z]+)\d+"', attrs)
@@ -187,13 +196,13 @@ def read_xlsx_bytes(data: bytes):
                 idx -= 1
             val = ""
             if 't="s"' in attrs:
-                v = re.search(r"<v>(\d+)</v>", body)
+                v = re.search(rf"<{P}v>(\d+)</{P}v>", body)
                 if v and int(v.group(1)) < len(shared):
                     val = shared[int(v.group(1))]
             elif 't="inlineStr"' in attrs:
-                val = "".join(re.findall(r"<t[^>]*>(.*?)</t>", body, re.S))
+                val = "".join(re.findall(rf"<{P}t[^>]*>(.*?)</{P}t>", body, re.S))
             else:
-                v = re.search(r"<v>(.*?)</v>", body, re.S)
+                v = re.search(rf"<{P}v>(.*?)</{P}v>", body, re.S)
                 val = v.group(1) if v else ""
             cells[idx] = unesc(val)
             maxi = max(maxi, idx)
