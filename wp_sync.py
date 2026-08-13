@@ -821,6 +821,36 @@ def sync_investment(ssh: SSHClient, inv: dict) -> Tuple[str, Optional[int]]:
             log(f"  EXCLUDED (not real estate) — no post created: {name}")
         return "excluded", post_id
 
+    # Publication ban. ExPro shows "Zakaz publikacji" instead of "Zgoda na
+    # publikację" when the developer refuses to have the investment published.
+    # The REST API carries neither badge, so this pipeline could not see the
+    # refusal and published 50 investments — 2446 units — against it, until one
+    # developer phoned. The post and its meta stay; only its visibility goes.
+    if inv.get("zakaz_publikacji"):
+        if post_id:
+            try:
+                ssh.run_wp_cli(f"post update {post_id} --post_status=draft", timeout=30)
+                ssh.run_wp_cli(f"post meta update {post_id} _expro_zakaz_publikacji 1", timeout=30)
+                log(f"  ZAKAZ PUBLIKACJI — hidden: {name} (WP ID: {post_id})")
+            except Exception as e:
+                log(f"  ZAKAZ PUBLIKACJI but hiding failed for {name} (WP ID: {post_id}): {e}")
+        else:
+            log(f"  ZAKAZ PUBLIKACJI — no post created: {name}")
+        return "excluded", post_id
+
+    # Ban lifted: a post hidden by this rule, and only by this rule, comes back.
+    # A post drafted for the other reason — gone from the feed — is left alone.
+    if post_id:
+        try:
+            marked = ssh.run_wp_cli(
+                f"post meta get {post_id} _expro_zakaz_publikacji", timeout=30).strip()
+            if marked == "1":
+                ssh.run_wp_cli(f"post update {post_id} --post_status=publish", timeout=30)
+                ssh.run_wp_cli(f"post meta delete {post_id} _expro_zakaz_publikacji", timeout=30)
+                log(f"  ZAKAZ LIFTED — republished: {name} (WP ID: {post_id})")
+        except Exception:
+            pass
+
     action = "update" if post_id else "create"
 
     # change detection

@@ -453,6 +453,14 @@ foreach ($units as $u) {
     // draft that shows up in the summary than a wrong page in the catalogue.
     $publishable   = in_array($rodzaj, ['mieszkanie', 'dom'], true);
     $target_status = $publishable ? 'publish' : 'draft';
+    // A unit of an investment the developer forbids publishing must never be
+    // public, whatever its own type says. The flag rides on the investment
+    // ("Zakaz publikacji" in ExPro's detail header) and is carried in the
+    // payload; the marker meta records the reason, which is not the same as
+    // the draft the reconciler sets when a unit disappears from the feed.
+    if (!empty($data['zakaz_publikacji'])) {
+        $target_status = 'draft';
+    }
 
     // ── Address ──────────────────────────────────────────────────────────
     $street  = $inv['street'] ?? '';
@@ -522,6 +530,8 @@ foreach ($units as $u) {
     if (!empty($existing)) {
         $post_id   = (int)$existing[0];
         $upd_args  = ['ID' => $post_id, 'post_title' => $title, 'post_status' => $target_status];
+        if (!empty($data['zakaz_publikacji'])) update_post_meta($post_id, '_expro_zakaz_publikacji', '1');
+        elseif (get_post_meta($post_id, '_expro_zakaz_publikacji', true)) delete_post_meta($post_id, '_expro_zakaz_publikacji');
         if ($target_status === 'draft' && get_post_status($post_id) === 'publish') $unpublished++;
         // Skip overwriting description if manually locked
         if (!get_post_meta($post_id, '_description_locked', true)) {
@@ -955,6 +965,10 @@ def sync_units(ssh: SSHClient, inv: dict, parent_id: int, projekt_term_id: int) 
                 str(inv.get('expro_id') or inv.get('id', '')), ''),
         },
         'inv_extra':       inv.get('extra', {}),
+        # Developer's refusal to have this investment published. Absent means
+        # the dump predates the flag — treated as banned, because publishing
+        # against a refusal is the failure that cost us a phone call.
+        'zakaz_publikacji': bool(inv.get('zakaz_publikacji', True)),
         'parent_id':       parent_id,
         'projekt_term_id': projekt_term_id,
     }

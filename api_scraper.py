@@ -644,6 +644,21 @@ def parse_investment_page(page: str) -> dict:
     # Commission terms keep their own proven reader: it resolves 170 of 170
     # investments today and there is nothing to gain from rewriting it here.
     out["zasady"] = parse_zasady(page)
+
+    # Publication consent. ExPro shows one of two badges in the detail header:
+    # "Zgoda na publikację" (green) or "Zakaz publikacji" (red). The REST API
+    # carries neither, so the ban was invisible to this pipeline and 50
+    # investments — 2446 units — were published against the developer's
+    # explicit refusal until one of them phoned to complain.
+    # Absent badge is treated as banned: with a developer's consent at stake,
+    # the safe default is not to publish.
+    if re.search(r"Zakaz\s+publikacji", page, re.I):
+        out["zakaz_publikacji"] = True
+    elif re.search(r"Zgoda\s+na\s+publikacj", page, re.I):
+        out["zakaz_publikacji"] = False
+    else:
+        out["zakaz_publikacji"] = True
+
     return out
 
 
@@ -748,6 +763,11 @@ def fill_from_html_concurrent(session: requests.Session, results: list[dict]) ->
             # published prices there.
             inv["danegov_sync"] = page.get("danegov_sync", "")
             inv["danegov_price_update"] = page.get("danegov_price_update", "")
+            # Whether the developer allows publishing at all. Written
+            # unconditionally: a ban that is lifted must be able to travel back
+            # the other way, and a stale True would keep an investment hidden
+            # after the developer changed their mind.
+            inv["zakaz_publikacji"] = bool(page.get("zakaz_publikacji", True))
 
             inv["scrape_hash"] = scrape_hash(inv)
     return stats
@@ -771,7 +791,7 @@ def scrape_hash(inv: dict) -> str:
     key = json.dumps(
         {k: inv.get(k) for k in
          ["name", "price_from_raw", "delivery", "units_count",
-          "units_available", "zasady_wspolpracy",
+          "units_available", "zasady_wspolpracy", "zakaz_publikacji",
           # Added with the HTML pass: without them a developer publishing a
           # website, a new document or a changed lift answer would never
           # reach WordPress, because wp_sync skips on an unchanged hash.
