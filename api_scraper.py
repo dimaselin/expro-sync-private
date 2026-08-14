@@ -1219,6 +1219,19 @@ def main() -> None:
         log("  WARNING: units without a type are classified by default — "
             "check the failures above before trusting projekt_typ")
 
+    # A build that produced nothing while the API listed investments is a
+    # failure, and it has to look like one. When ExPro changed the shape of
+    # `pictures`, build_investment raised on every single investment; this file
+    # was written empty, the two sync steps downstream cheerfully loaded zero
+    # investments, and the workflow went green while the catalogue quietly
+    # stopped updating. Exiting non-zero here is what turns the next such
+    # change into a red run instead of a silent freeze — and it happens before
+    # the write, so an empty result never replaces a good file or its cache.
+    if investments and not results:
+        log(f"FATAL: {len(investments)} investment(s) listed, 0 built — "
+            f"refusing to overwrite {DATA_FILE} with an empty result.")
+        sys.exit(1)
+
     # Save
     out_path = Path(DATA_FILE)
     out_path.parent.mkdir(parents=True, exist_ok=True)
