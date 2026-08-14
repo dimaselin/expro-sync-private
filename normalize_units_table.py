@@ -49,6 +49,25 @@ def parse_rooms(raw: str):
 
 
 def fetch_investments(ssh: SSHClient, investment_ids=None) -> list:
+    """Investments this table is allowed to mirror — ExPro's, and only ExPro's.
+
+    An investment with no expro_id was entered by hand because ExPro does not
+    carry it, and it must stay out of here for two reasons.
+
+    The first is that this table is what decides whether an investment page
+    stays published. reconcile_gone_units.py joins it and drafts any investment
+    whose units are all gone; a hand-entered one can never match a property post
+    (fetch_properties() below looks units up by their investment's expro_id, and
+    there isn't one), so every row would count as dead and the page would be
+    unpublished on the first run after it was created — for having been created.
+
+    The second is that the unique key is (expro_investment_id, unit_name). With
+    an empty expro_investment_id every manual investment shares one namespace,
+    so the second one with a unit called "1A" would overwrite the first one's.
+
+    No existing investment lacks an expro_id, so this changes nothing about what
+    is mirrored today; it only keeps the manual ones out from here on.
+    """
     where = ""
     if investment_ids:
         ids_csv = ",".join(str(i) for i in investment_ids)
@@ -58,10 +77,12 @@ $args = ['post_type'=>'inwestycja','posts_per_page'=>-1,'post_status'=>'publish'
 $ids = get_posts($args);
 $out = [];
 foreach ($ids as $id) {{
+    $expro_id = get_post_meta($id, 'expro_id', true);
+    if (!$expro_id) continue;   // hand-entered investment — not ExPro's to mirror
     $out[] = [
         'post_id'   => $id,
         'name'      => get_the_title($id),
-        'expro_id'  => get_post_meta($id, 'expro_id', true),
+        'expro_id'  => $expro_id,
         'lokale'    => get_post_meta($id, 'expro_lokale_json', true),
     ];
 }}
