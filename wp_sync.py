@@ -1039,9 +1039,22 @@ def sync_investment(ssh: SSHClient, inv: dict) -> Tuple[str, Optional[int]]:
         # Everything below goes up in one call instead of one per field.
         bulk: dict = {k: v for k, v in meta_fields if v}
 
+        # The developer's own site, kept for internal use only — pipeline.py
+        # scrapes it for the finishing standard and the payment plan.
+        #
+        # It used to be written to `projekt_subdomain_url`, which is a different
+        # thing: that field exists for OUR landing subdomains (its placeholder
+        # says biestrzykow.realsymanagement.pl), and the catalogue card in
+        # functions.php links to whatever it holds — `$target_link = $subdomain
+        # ?: $link` — in a new tab. So every card whose investment had this
+        # filled sent the visitor to the developer instead of to us, and named
+        # the developer while doing it. Measured before the change: 184
+        # investments held a foreign URL there and none held one of ours; 29 of
+        # them pointed at ExPro's App Store listing, which is what the scraper
+        # had picked up as a "developer website".
         dev_url = inv.get("developer_url", "")
         if dev_url:
-            bulk["projekt_subdomain_url"] = dev_url
+            bulk["projekt_developer_url"] = dev_url
 
         # extra fields from the investment detail page ("Więcej informacji")
         extra = inv.get("extra", {})

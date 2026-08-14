@@ -524,7 +524,12 @@ def enrich(post_id: int, expro_id: str, api_key: str = '', steps: list = None,
 
     try:
         expro_data   = load_expro(expro_id)
-        subdomain    = wp.get_meta(post_id, 'projekt_subdomain_url').strip()
+        # The developer's site moved to its own key, because
+        # projekt_subdomain_url is rendered as a catalogue card link and this
+        # value must never be. Old key kept as a fallback for posts not yet
+        # migrated.
+        subdomain    = (wp.get_meta(post_id, 'projekt_developer_url').strip()
+                        or wp.get_meta(post_id, 'projekt_subdomain_url').strip())
         website_text = ''
         pdf_urls     = []
         pdf_texts    = []
