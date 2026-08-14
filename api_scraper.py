@@ -881,11 +881,23 @@ def build_investment(
     # 64: import_media.py skips any post that already has projekt_galeria, and
     # wp_sync only reaches its image block when scrape_hash changed — and the
     # hash does not cover photos. They need a one-off re-order pass.
+    # ExPro changed both the shape and the content of this field some time after
+    # 2026-08-13: `pictures` used to be a comma-separated string of bare file
+    # names and is now a JSON array of paths ("/files/investments/<hash>.jpeg").
+    # The old code called .split(",") on it, so build_investment raised
+    # AttributeError on all 166 investments and every one of them was dropped
+    # from the run — the scrape was returning an empty file, and one more
+    # nightly run would have left the whole catalogue frozen with no error
+    # anyone would see. Both shapes and both value forms are accepted here, so
+    # this survives ExPro changing its mind back.
     images: list[str] = []
     image_url_map: dict[str, str] = {}
     pics_raw = api_inv.get("pictures") or api_inv.get("picture") or ""
-    main_pic = (api_inv.get("picture") or "").strip()
-    pic_names = [p.strip() for p in pics_raw.split(",") if p.strip()]
+    if isinstance(pics_raw, (list, tuple)):
+        pic_names = [str(p).strip() for p in pics_raw if str(p).strip()]
+    else:
+        pic_names = [p.strip() for p in str(pics_raw).split(",") if p.strip()]
+    main_pic = str(api_inv.get("picture") or "").strip()
     if main_pic:
         pic_names = [main_pic] + [p for p in pic_names if p != main_pic]
     seen_pics: set[str] = set()
@@ -893,10 +905,18 @@ def build_investment(
     for pic in pic_names:
         if pic and pic not in seen_pics:
             seen_pics.add(pic)
-            img_url = f"{BASE_URL}/files/investments/{pic}"
+            # A bare name still gets the investments folder prepended; a value
+            # that already carries its own path is used as it stands, or the
+            # URL comes out as /files/investments//files/investments/… and 404s.
+            if pic.startswith(("http://", "https://")):
+                img_url = pic
+            elif pic.startswith("/"):
+                img_url = f"{BASE_URL}{pic}"
+            else:
+                img_url = f"{BASE_URL}/files/investments/{pic}"
             images.append(img_url)
             img_gallery_dir.mkdir(parents=True, exist_ok=True)
-            local = img_gallery_dir / pic
+            local = img_gallery_dir / Path(pic).name
             if download_image(img_url, local, session=session):
                 image_url_map[img_url] = str(local)
 

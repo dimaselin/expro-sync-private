@@ -137,6 +137,18 @@ class WPClient:
     def get_meta(self, post_id: int, key: str) -> str:
         return self.wp(f'post meta get {post_id} {key}')
 
+    def manual_locks(self, post_id: int) -> set:
+        """Fields a human owns on this post. See wp_sync.get_manual_locks()."""
+        raw = self.get_meta(post_id, '_realsy_manual_lock').strip()
+        if not raw or raw.startswith('Error'):
+            return set()
+        try:
+            parsed = json.loads(raw)
+            entries = parsed if isinstance(parsed, list) else [parsed]
+        except (ValueError, TypeError):
+            entries = raw.split(',')
+        return {str(e).strip() for e in entries if str(e).strip()}
+
     def update_meta_plain(self, post_id: int, key: str, text: str):
         tmp = f'/tmp/rm_meta_{post_id}_{key}.txt'
         with self._sftp.open(tmp, 'w') as f:
@@ -441,8 +453,14 @@ def save_documents(wp: WPClient, post_id: int, pdf_urls: list):
 def save_parsed(wp: WPClient, post_id: int, parsed: dict, force: bool = False) -> list:
     saved = []
 
+    locked = wp.manual_locks(post_id)
+
     def _set(key, value, is_json=False):
         if not value:
+            return
+        # --force exists to overwrite what the enricher wrote last time, not
+        # what a person wrote on purpose.
+        if any(key == p or (p.endswith('*') and key.startswith(p[:-1])) for p in locked):
             return
         current = wp.get_meta(post_id, key).strip()
         if current and not force:

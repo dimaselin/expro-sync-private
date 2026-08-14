@@ -336,11 +336,15 @@ def build_post_content(inv: dict) -> str:
     desc = inv.get("description", {})
     parts = []
 
+    # The developer's name is deliberately absent. It is kept in
+    # projekt_developer for internal use, but naming them in the body text hands
+    # a visitor the party to call instead of us — and the standing rule on this
+    # site is that no page names the developer. It was printed in this opening
+    # line on 101 of the 102 published investments; the meta stays, the sentence
+    # does not.
     city = inv.get("city", "")
-    developer = inv.get("developer", "")
-    if city or developer:
-        intro = ", ".join(filter(None, [city, developer]))
-        parts.append(f"<p>{intro}</p>")
+    if city:
+        parts.append(f"<p>{city}</p>")
 
     for key, label in [
         ("udogodnienia", "Udogodnienia"),
@@ -799,6 +803,59 @@ def get_existing_hash(ssh: SSHClient, post_id: int) -> str:
         return ""
 
 
+# ---------------------------------------------------------------------------
+# Manual overrides
+# ---------------------------------------------------------------------------
+# An investment that carries an expro_id is rewritten by this script every
+# night, so anything a human corrects on it survives exactly until the next run
+# — which is why hand-filled pages were pointless before this existed. Some
+# investments arrive from the open dane.gov.pl registry rather than a
+# developer's feed (37 of 102 published ones): the registry sends price, area
+# and unit count and nothing else, so completion date, rooms, street, heating
+# and plot areas have to come from the developer by hand, and they have to
+# survive.
+#
+# The post names the fields it owns in _realsy_manual_lock, a JSON array. Each
+# entry is a meta key, `post_title`, `post_content`, or a `tax:<taxonomy>`
+# name; a trailing `*` matches a prefix (`projekt_cecha_*`). Everything not
+# listed keeps coming from ExPro, which is the point — locking the whole post
+# would freeze prices and availability, and stale prices are worse than thin
+# ones.
+MANUAL_LOCK_META = "_realsy_manual_lock"
+
+
+def get_manual_locks(ssh: SSHClient, post_id: int) -> set:
+    """Field names on this post that a human owns and the sync must not write."""
+    if not post_id:
+        return set()
+    try:
+        raw = ssh.run_wp_cli(f"post meta get {post_id} {MANUAL_LOCK_META}", timeout=30).strip()
+    except Exception:
+        return set()          # no such meta — nothing is locked
+    if not raw:
+        return set()
+    try:
+        parsed = json.loads(raw)
+        entries = parsed if isinstance(parsed, list) else [parsed]
+    except (ValueError, TypeError):
+        # A comma-separated list is what someone typing this by hand in WP
+        # Admin would leave behind; accept it rather than silently protect
+        # nothing.
+        entries = raw.split(",")
+    return {str(e).strip() for e in entries if str(e).strip()}
+
+
+def is_locked(locks: set, key: str) -> bool:
+    if not locks:
+        return False
+    for pattern in locks:
+        if pattern == key:
+            return True
+        if pattern.endswith("*") and key.startswith(pattern[:-1]):
+            return True
+    return False
+
+
 def sync_investment(ssh: SSHClient, inv: dict) -> Tuple[str, Optional[int]]:
     """
     Returns ('created'|'updated'|'skipped'|'excluded'|'failed', post_id).
@@ -853,6 +910,9 @@ def sync_investment(ssh: SSHClient, inv: dict) -> Tuple[str, Optional[int]]:
 
     action = "update" if post_id else "create"
 
+    # Fields a human owns on this post. A post being created has none.
+    locks = get_manual_locks(ssh, post_id) if post_id else set()
+
     # change detection
     if post_id and current_hash:
         existing_hash = get_existing_hash(ssh, post_id)
@@ -878,7 +938,7 @@ def sync_investment(ssh: SSHClient, inv: dict) -> Tuple[str, Optional[int]]:
             if not post_id_raw.isdigit():
                 raise RuntimeError(f"post create returned non-ID: {post_id_raw!r}")
             post_id = int(post_id_raw)
-        else:
+        elif not is_locked(locks, "post_title"):
             # update title
             ssh.run_wp_cli(
                 f"post update {post_id} --post_title={shlex.quote(name)}",
@@ -886,7 +946,8 @@ def sync_investment(ssh: SSHClient, inv: dict) -> Tuple[str, Optional[int]]:
             )
 
         # Update post content via remote file (can be long)
-        update_meta_via_eval_or_update_post(ssh, post_id, post_content)
+        if not is_locked(locks, "post_content"):
+            update_meta_via_eval_or_update_post(ssh, post_id, post_content)
 
         # ── meta fields ──────────────────────────────────────────────────────
         city     = inv.get("city", "")
@@ -1017,6 +1078,16 @@ def sync_investment(ssh: SSHClient, inv: dict) -> Tuple[str, Optional[int]]:
             normalize_units(inv.get("units", [])), ensure_ascii=False
         )
 
+        # Hand-held fields drop out here, right before the write, so every path
+        # that fills `bulk` above is covered by one rule rather than each
+        # remembering to check.
+        if locks:
+            kept = sorted(k for k in bulk if is_locked(locks, k))
+            if kept:
+                for k in kept:
+                    del bulk[k]
+                log(f"  manual lock — kept {len(kept)} field(s): {', '.join(kept)}")
+
         update_meta_bulk(ssh, post_id, bulk)
 
         # ── images ───────────────────────────────────────────────────────────
@@ -1026,14 +1097,14 @@ def sync_investment(ssh: SSHClient, inv: dict) -> Tuple[str, Optional[int]]:
             att_id = import_image_to_wp(ssh, img_url, post_id)
             if att_id:
                 gallery_ids.append(att_id)
-                if i == 0:
+                if i == 0 and not is_locked(locks, "_thumbnail_id"):
                     # set featured image
                     try:
                         ssh.run_wp_cli(f"post meta update {post_id} _thumbnail_id {att_id}")
                     except Exception as e:
                         log(f"  Featured image set failed: {e}")
 
-        if gallery_ids:
+        if gallery_ids and not is_locked(locks, "projekt_galeria"):
             gallery_str = ",".join(str(x) for x in gallery_ids)
             try:
                 update_meta(ssh, post_id, "projekt_galeria", gallery_str)

@@ -291,6 +291,37 @@ if (!function_exists('esm_resolve_type')) {
         return [$slug, $src];
     }
 }
+// ── Manual overrides ──────────────────────────────────────────────────────
+// The investment-level twin of this lives in wp_sync.py. A unit whose data
+// came from the open registry rather than a developer feed has no plot area,
+// no real floor plan and often the wrong availability, so those get filled by
+// hand — and without this they would last exactly one night. The post lists
+// the fields it owns in _realsy_manual_lock (JSON array of meta keys,
+// `post_title`, `post_content`, or `tax:<taxonomy>`; trailing `*` matches a
+// prefix). Price and status stay ExPro's unless explicitly named, because a
+// frozen price is a worse lie than a missing one.
+if (!function_exists('esm_locked')) {
+    function esm_locked($post_id, $key) {
+        static $cache = [];
+        if (!array_key_exists($post_id, $cache)) {
+            $raw  = (string) get_post_meta($post_id, '_realsy_manual_lock', true);
+            $list = [];
+            if ($raw !== '') {
+                $dec = json_decode($raw, true);
+                if (is_array($dec))      $list = $dec;
+                elseif (is_string($dec)) $list = [$dec];
+                else                     $list = explode(',', $raw);
+            }
+            $cache[$post_id] = array_filter(array_map('trim', array_map('strval', $list)));
+        }
+        foreach ($cache[$post_id] as $pattern) {
+            if ($pattern === $key) return true;
+            if (str_ends_with($pattern, '*')
+                && str_starts_with($key, substr($pattern, 0, -1))) return true;
+        }
+        return false;
+    }
+}
 if (!function_exists('esm_put')) {
     function esm_put($post_id, $key, $val) {
         static $clearable = [
@@ -308,6 +339,7 @@ if (!function_exists('esm_put')) {
             'fave_property_bathrooms',
         ];
         $val      = (string) $val;
+        if (esm_locked($post_id, $key)) { esm_stat('kept'); return; }
         $existing = (string) get_post_meta($post_id, $key, true);
         if ($val !== '') {
             update_post_meta($post_id, $key, $val);
@@ -529,12 +561,14 @@ foreach ($units as $u) {
     // ── Create or update post ────────────────────────────────────────────
     if (!empty($existing)) {
         $post_id   = (int)$existing[0];
-        $upd_args  = ['ID' => $post_id, 'post_title' => $title, 'post_status' => $target_status];
+        $upd_args  = ['ID' => $post_id, 'post_status' => $target_status];
+        if (!esm_locked($post_id, 'post_title')) $upd_args['post_title'] = $title;
         if (!empty($data['zakaz_publikacji'])) update_post_meta($post_id, '_expro_zakaz_publikacji', '1');
         elseif (get_post_meta($post_id, '_expro_zakaz_publikacji', true)) delete_post_meta($post_id, '_expro_zakaz_publikacji');
         if ($target_status === 'draft' && get_post_status($post_id) === 'publish') $unpublished++;
         // Skip overwriting description if manually locked
-        if (!get_post_meta($post_id, '_description_locked', true)) {
+        if (!get_post_meta($post_id, '_description_locked', true)
+            && !esm_locked($post_id, 'post_content')) {
             $upd_args['post_content'] = $content;
         }
         wp_update_post($upd_args);
@@ -616,11 +650,13 @@ foreach ($units as $u) {
     }
 
     // Unit amenities — only overwrite if scraper explicitly provided the key
-    if (array_key_exists('has_balcony',  $u)) update_post_meta($post_id, 'lokal_balkon',  $u['has_balcony']  ? '1' : '0');
-    if (array_key_exists('has_terrace',  $u)) update_post_meta($post_id, 'lokal_taras',   $u['has_terrace']  ? '1' : '0');
-    if (array_key_exists('has_garden',   $u)) update_post_meta($post_id, 'lokal_ogrodek', $u['has_garden']   ? '1' : '0');
-    if (array_key_exists('has_basement', $u)) update_post_meta($post_id, 'lokal_piwnica', $u['has_basement'] ? '1' : '0');
-    if (array_key_exists('has_garage',   $u)) update_post_meta($post_id, 'lokal_garaz',   $u['has_garage']   ? '1' : '0');
+    // (and the field is not one a human has claimed: ExPro reports no garage on
+    // developments whose own plans show one per house).
+    if (array_key_exists('has_balcony',  $u) && !esm_locked($post_id, 'lokal_balkon'))  update_post_meta($post_id, 'lokal_balkon',  $u['has_balcony']  ? '1' : '0');
+    if (array_key_exists('has_terrace',  $u) && !esm_locked($post_id, 'lokal_taras'))   update_post_meta($post_id, 'lokal_taras',   $u['has_terrace']  ? '1' : '0');
+    if (array_key_exists('has_garden',   $u) && !esm_locked($post_id, 'lokal_ogrodek')) update_post_meta($post_id, 'lokal_ogrodek', $u['has_garden']   ? '1' : '0');
+    if (array_key_exists('has_basement', $u) && !esm_locked($post_id, 'lokal_piwnica')) update_post_meta($post_id, 'lokal_piwnica', $u['has_basement'] ? '1' : '0');
+    if (array_key_exists('has_garage',   $u) && !esm_locked($post_id, 'lokal_garaz'))   update_post_meta($post_id, 'lokal_garaz',   $u['has_garage']   ? '1' : '0');
 
     // ── Taxonomies ───────────────────────────────────────────────────────
     // A unit can now carry two labels. Order here means nothing —
@@ -633,8 +669,15 @@ foreach ($units as $u) {
         $labels[] = $label_inw_tid;
     }
     wp_set_object_terms($post_id, $labels, 'property_label');
-    wp_set_object_terms($post_id, [$status_slug, 'sprzedaz'], 'property_status');
-    wp_set_object_terms($post_id, [$type_slug],   'property_type');
+    // Availability can be the one thing the registry gets wrong: a unit the
+    // developer's own table calls reserved arrives here as available, and
+    // advertising it free is the expensive kind of wrong.
+    if (!esm_locked($post_id, 'tax:property_status')) {
+        wp_set_object_terms($post_id, [$status_slug, 'sprzedaz'], 'property_status');
+    }
+    if (!esm_locked($post_id, 'tax:property_type')) {
+        wp_set_object_terms($post_id, [$type_slug],   'property_type');
+    }
     if ($projekt_tid) {
         wp_set_object_terms($post_id, [$projekt_tid], 'projekt');
     }
