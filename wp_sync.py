@@ -737,6 +737,18 @@ def build_standard_text(inv: dict) -> str:
 # Main sync function
 # ---------------------------------------------------------------------------
 
+class PostLookupFailed(RuntimeError):
+    """The lookup could not answer — which is not the same as "no post exists".
+
+    Treating the two alike is how a dropped SSH connection creates a duplicate
+    investment: find_existing_post swallowed the error, returned None, and the
+    caller read that as "nothing here yet" and created a second post beside the
+    live one. It happened twice in one run on 2026-08-14 (Zakątek Bliż and Nowe
+    Miłoszyce II), and it is the same failure the five June duplicates came
+    from. A run that cannot tell must stop, not guess.
+    """
+
+
 def find_existing_post(ssh: SSHClient, expro_id: str) -> Optional[int]:
     """The post this investment should be written to.
 
@@ -751,28 +763,34 @@ def find_existing_post(ssh: SSHClient, expro_id: str) -> Optional[int]:
     parts matter: the first is what makes it correct, the second is what makes
     it the same answer every run.
     """
-    try:
-        out = ssh.run_wp_cli(
-            f"post list --post_type={shlex.quote(WP['post_type'])} "
-            f"--post_status=any "
-            f"--meta_key=expro_id --meta_value={shlex.quote(expro_id)} "
-            f"--fields=ID,post_status --format=csv"
-        )
-        rows = []
-        for line in out.splitlines():
-            parts = [p.strip() for p in line.strip().split(",")]
-            if len(parts) >= 2 and parts[0].isdigit():
-                rows.append((int(parts[0]), parts[1]))
-        if not rows:
-            return None
-        if len(rows) > 1:
-            log(f"  NOTE: expro_id={expro_id} has {len(rows)} posts: "
-                f"{', '.join(f'{i}({s})' for i, s in rows)}")
-        rows.sort(key=lambda r: (r[1] != "publish", r[0]))
-        return rows[0][0]
-    except Exception as e:
-        log(f"  find_existing_post error: {e}")
-    return None
+    cmd = (
+        f"post list --post_type={shlex.quote(WP['post_type'])} "
+        f"--post_status=any "
+        f"--meta_key=expro_id --meta_value={shlex.quote(expro_id)} "
+        f"--fields=ID,post_status --format=csv"
+    )
+    # One retry: SSHClient drops its connection on error and reconnects on the
+    # next call, so the usual transient failure clears by itself.
+    last_error: Optional[Exception] = None
+    for attempt in (1, 2):
+        try:
+            out = ssh.run_wp_cli(cmd)
+            rows = []
+            for line in out.splitlines():
+                parts = [p.strip() for p in line.strip().split(",")]
+                if len(parts) >= 2 and parts[0].isdigit():
+                    rows.append((int(parts[0]), parts[1]))
+            if not rows:
+                return None
+            if len(rows) > 1:
+                log(f"  NOTE: expro_id={expro_id} has {len(rows)} posts: "
+                    f"{', '.join(f'{i}({s})' for i, s in rows)}")
+            rows.sort(key=lambda r: (r[1] != "publish", r[0]))
+            return rows[0][0]
+        except Exception as e:
+            last_error = e
+            log(f"  find_existing_post attempt {attempt} failed: {e or type(e).__name__}")
+    raise PostLookupFailed(str(last_error) or type(last_error).__name__)
 
 
 def get_all_posts_expro(ssh: SSHClient) -> list:
@@ -865,7 +883,13 @@ def sync_investment(ssh: SSHClient, inv: dict) -> Tuple[str, Optional[int]]:
     current_hash = inv.get("scrape_hash", "")
 
     # check existing
-    post_id = find_existing_post(ssh, expro_id)
+    try:
+        post_id = find_existing_post(ssh, expro_id)
+    except PostLookupFailed as e:
+        # Fail closed. Creating here would duplicate a page that already exists
+        # and carries the units; skipping costs one investment one night.
+        log(f"  ✗ SKIPPED — cannot tell whether a post exists for {name}: {e}")
+        return "failed", None
 
     if is_excluded_from_site(expro_id, inv):
         if post_id:
