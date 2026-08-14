@@ -626,7 +626,14 @@ foreach ($units as $u) {
         // Unit amenities — only write if explicitly provided (absent = preserve existing WP value)
         'lokal_balkon_m2'             => $u['balcony_area'] ?? '',
         'lokal_taras_m2'              => $u['terrace_area'] ?? '',
-        'lokal_ogrodek_m2'            => $u['garden_area'] ?? '',
+        // `lokal_ogrod_m2`, not `lokal_ogrodek_m2`: the theme reads the former
+        // in both places it exists — the Meta Box field in functions.php and
+        // the Ogród column in single-inwestycja-domy.php — so everything the
+        // sync wrote under the longer name went nowhere. No unit is affected
+        // today (ExPro sends garden_area for none of them), which is exactly
+        // why it went unnoticed; the first investment that does report a garden
+        // would have shown an empty column.
+        'lokal_ogrod_m2'             => $u['garden_area'] ?? '',
         // Investment extras
         'inw_winda'                   => $inv_extra['winda'] ?? '',
         'inw_parking_naziemne_cena'   => $inv_extra['parking_naziemne_cena'] ?? '',
